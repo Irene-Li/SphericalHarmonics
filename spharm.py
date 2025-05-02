@@ -544,14 +544,16 @@ class SpHarm:
 # Example usage:
 if __name__ == "__main__":
 
+    from tqdm import tqdm
+
 
     # Organoid 5 & 40 (fairly spherical), 27 & 33 & 42 (one crypt, elongated), 20 & 32 (two crypts, elongated), 23 & 35 (two crypts, at an angle like mickey mouse), 29 (three crypts), 28 & 38 (blobby)
-    for n in [5, 20, 23, 27, 28, 29, 32, 33, 35, 38, 40, 42]:
+    for n in tqdm([5, 20, 23, 27, 28, 29, 32, 33, 35, 38, 40, 42]):
         path = f'Data/mesh/{n}.stl'
         m = SpHarm()
         m.load_mesh_from_file(path)  
         m.align_with_pca() 
         m.compute_initial_parameterization()
-        m.optimize(max_outer_iterations=30, primal_steps=100, verbose=False)
+        m.optimize(max_outer_iterations=100, primal_steps=100, verbose=False)
         clms = m.compute_sh_coefficients(lmax=15)
         m.save_results(f'sim/{n}')
