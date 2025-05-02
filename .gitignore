@@ -1,0 +1,10 @@
+.DS_Store
+/.ipynb_checkpoints
+/__pycache__
+/Data
+/igl_data
+/sim
+data_analysis.ipynb
+mesh_mapping.ipynb
+optimisation.ipynb
+plot_coor.ipynb
