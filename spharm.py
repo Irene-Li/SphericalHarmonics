@@ -82,7 +82,7 @@ class SpHarm:
         
         # Center and normalize
         self.v -= self.v.mean(0)
-        self.v /= self.v.max()
+        self.v /= np.abs(self.v).max()
     
     def load_from_arrays(self, vertices, faces):
         """

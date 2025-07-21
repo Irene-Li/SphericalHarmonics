@@ -69,8 +69,7 @@ def run_parallel_spharm(n_processes=None, chunk_size=1):
     """
     
     # Configuration data
-    # timepoints = ['day1p5', 'day2', 'day2p5', 'day3', 'day3p5', 'day4', 'day4p5', 'day4p5-more']
-    timepoints = ['day2']
+    timepoints = ['day1p5', 'day2', 'day2p5', 'day3', 'day3p5', 'day4', 'day4p5', 'day4p5-more']
 
     zarr_names = {
         'day1p5': 'r0.zarr',
