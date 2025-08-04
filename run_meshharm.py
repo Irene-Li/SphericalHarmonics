@@ -1,5 +1,5 @@
 from tqdm import tqdm
-from meshharm import MeshHarm
+from src.meshharm import MeshHarm
 import numpy as np 
 import os 
 
