@@ -1,10 +1,6 @@
 import numpy as np
 import igl
 import scipy.sparse as sp
-import jax
-import jax.numpy as jnp
-from jax import grad, jit, value_and_grad
-import optax
 import pyshtools as pysh
 from sklearn.decomposition import PCA
 import vtk
@@ -20,7 +16,7 @@ class MeshHarm(SpHarm):
     providing methods for mesh parameterization and optimization.
     """    
 
-    def _eig_decomp(self, k=100): 
+    def _eig_decomp(self, k=100, sigma=0): 
         """
         Compute the first k eigenvalues and eigenvectors of the Laplace-Beltrami operator.
         
@@ -31,12 +27,12 @@ class MeshHarm(SpHarm):
             eigvecs: Eigenvectors
         """
         L = -igl.cotmatrix(self.v, self.f)
-        M = igl.massmatrix(self.v, self.f, igl.MASSMATRIX_TYPE_VORONOI)
-        eigvals, eigvecs = sp.linalg.eigsh(L, k=k, M=M, sigma=0, which='LM')
-        return eigvals, eigvecs, M
+        self.mass_matrix = igl.massmatrix(self.v, self.f, igl.MASSMATRIX_TYPE_VORONOI)
+        self.eigvals, self.eigvecs = sp.linalg.eigsh(L, k=k, M=self.mass_matrix, sigma=sigma, which='LM')
+        return self.eigvals, self.eigvecs, self.mass_matrix
 
     
-    def compute_hks_and_coor_coefficients(self, lmax=15, ts=[0.1, 1, 10]):
+    def compute_coefficients(self, lmax=15, ts=[0.1, 1, 10]):
         '''
         Analyze optimized vertices using spherical harmonics.
 
@@ -56,18 +52,26 @@ class MeshHarm(SpHarm):
         '''
         self.lmax = lmax 
         k = int(lmax**2)
-        self.eigvals, self.eigvecs, mass_matrix = self._eig_decomp(k=k)
+        self._eig_decomp(k=k)
 
         hks = [] 
         for t in ts:
             hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
         self.hks = np.array(hks).T 
 
-        self.coeffs_hks = self.eigvecs.T @ (mass_matrix @ self.hks)
-        self.coeffs_v = self.eigvecs.T @ (mass_matrix @ self.v)
+        self.coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ self.hks)
+        self.coeffs_v = self.eigvecs.T @ (self.mass_matrix @ self.v)
         return self.coeffs_hks, self.coeffs_v
     
-    def reconstruct_from_coeffs(self, lmax=15):
+    def compute_hks_for_new_times(self, new_ts=[1, 5, 10]):
+        hks = [] 
+        for t in new_ts:
+            hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
+        hks = np.array(hks).T 
+        coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ hks)
+        return coeffs_hks
+
+    def reconstruct_from_coeffs(self, coeffs, lmax=15):
         '''
         Reconstruct the shape from harmonics coefficients.
         Args: 
@@ -77,16 +81,16 @@ class MeshHarm(SpHarm):
             Shape: (k, 3), where k = lmax**2 and 3 corresponds to the (x, y, z) coordinates of each vertex.
         '''
         if self.lmax >= lmax: 
-            v_reconstructed = self.eigvecs[:, :int(lmax**2)] @ self.coeffs_v[:int(lmax**2), :]
+            recon = self.eigvecs[:, :int(lmax**2)] @ coeffs[:int(lmax**2), :]
         else: 
             raise ValueError(f"lmax {self.lmax} is less than the requested lmax {lmax}. Please compute coefficients with lmax >= {lmax} first.")
-        return v_reconstructed
+        return recon
     
     def compute_spectrum(self, coeffs, lmax=15): 
         spectrum = [] 
         if lmax <= self.lmax: 
             for i in range(lmax):
-                spectrum.append(np.sum(coeffs[i**2:(i+1)**2]**2))
+                spectrum.append(np.sum(coeffs[i**2:(i+1)**2]**2, axis=0))
         else: 
             raise ValueError(f"lmax {self.lmax} is less than the requested lmax {lmax}. Please compute coefficients with lmax >= {lmax} first.")
         return np.array(spectrum)
@@ -94,7 +98,7 @@ class MeshHarm(SpHarm):
     def compute_recon_quality(self, lmax=None): 
         if lmax is None:
             lmax = self.lmax
-        v_recon = self.reconstruct_from_coeffs(lmax=lmax)
+        v_recon = self.reconstruct_from_coeffs(self.coeffs_v, lmax=lmax)
         diff = self.v - v_recon 
         return np.linalg.norm(diff) / np.linalg.norm(self.v)
 
