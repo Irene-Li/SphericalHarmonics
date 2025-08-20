@@ -72,8 +72,8 @@ if __name__ == "__main__":
         'day4p5-more':['cell_features'],
     }
 
+    # this is where data are saved 
     folder_path = 'Data/20250818/fractal_output/'
-    # blacklist = []
 
     for timepoint in timepoints:
         zarr_name = zarr_names[timepoint]

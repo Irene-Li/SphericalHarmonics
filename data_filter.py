@@ -78,6 +78,10 @@ if __name__ == "__main__":
         'day4p5-more':['mesh_features', 'nnorg_linked_expanded1_features'],
     }
 
+    # this is where the mesh files are stored with the mesh feature tables 
+    read_path = 'Data/mesh_dataset/fractal_output/'
+
+    # this is where we want to save a list of good organoids, so the folder with fate markers 
     save_folder_path = 'Data/20250818/fractal_output/'
     save_extra = '_zillum_registered'
 
@@ -86,7 +90,7 @@ if __name__ == "__main__":
         zarr_name = zarr_names[timepoint]
         for well_name in wells[timepoint]:
             round_name = rounds[timepoint][0]
-            path = f"Data/mesh_dataset/fractal_output/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/"
+            path = f"{read_path}/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/"
             feature_table_name = f"tables/{tables[timepoint][1]}"
             mesh_table_name = f"tables/{tables[timepoint][0]}"
             save_path = f"{save_folder_path}/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}{save_extra}/"
