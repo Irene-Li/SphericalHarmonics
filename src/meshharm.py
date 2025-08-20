@@ -62,14 +62,19 @@ class MeshHarm(SpHarm):
         self.coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ self.hks)
         self.coeffs_v = self.eigvecs.T @ (self.mass_matrix @ self.v)
         return self.coeffs_hks, self.coeffs_v
+
     
-    def compute_hks_for_new_times(self, new_ts=[1, 5, 10]):
+    def compute_hks_for_new_times(self, new_ts=[1, 5, 10], coeffs=True):
         hks = [] 
         for t in new_ts:
             hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
         hks = np.array(hks).T 
-        coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ hks)
-        return coeffs_hks
+
+        if coeffs: 
+            coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ hks)
+            return coeffs_hks
+        else: 
+            return hks 
 
     def reconstruct_from_coeffs(self, coeffs, lmax=15):
         '''
@@ -100,7 +105,7 @@ class MeshHarm(SpHarm):
             lmax = self.lmax
         v_recon = self.reconstruct_from_coeffs(self.coeffs_v, lmax=lmax)
         diff = self.v - v_recon 
-        return np.linalg.norm(diff) / np.linalg.norm(self.v)
+        return np.sqrt(np.sum(diff**2))
 
     def save_results(self, path):
         """

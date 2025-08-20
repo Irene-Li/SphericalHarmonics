@@ -78,6 +78,8 @@ if __name__ == "__main__":
         'day4p5-more':['mesh_features', 'nnorg_linked_expanded1_features'],
     }
 
+    save_folder_path = 'Data/20250818/fractal_output/'
+    save_extra = '_zillum_registered'
 
     # filter out organoids based on mesh segmentation quality 
     for timepoint in timepoints:
@@ -87,5 +89,5 @@ if __name__ == "__main__":
             path = f"Data/mesh_dataset/fractal_output/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/"
             feature_table_name = f"tables/{tables[timepoint][1]}"
             mesh_table_name = f"tables/{tables[timepoint][0]}"
-            save_path = f"Data/20250714/fractal_output/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}_zillum/"
+            save_path = f"{save_folder_path}/{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}{save_extra}/"
             filter_out_organoids(path, feature_table_name, mesh_table_name, save_path, tol=1)
