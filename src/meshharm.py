@@ -16,7 +16,7 @@ class MeshHarm(SpHarm):
     providing methods for mesh parameterization and optimization.
     """    
 
-    def _eig_decomp(self, k=100, sigma=0): 
+    def _eig_decomp(self, v, f, k=100, sigma=0): 
         """
         Compute the first k eigenvalues and eigenvectors of the Laplace-Beltrami operator.
         
@@ -26,15 +26,15 @@ class MeshHarm(SpHarm):
             eigvals: Eigenvalues
             eigvecs: Eigenvectors
         """
-        L = -igl.cotmatrix(self.v, self.f)
-        self.mass_matrix = igl.massmatrix(self.v, self.f, igl.MASSMATRIX_TYPE_VORONOI)
-        self.eigvals, self.eigvecs = sp.linalg.eigsh(L, k=k, M=self.mass_matrix, sigma=sigma, which='LM')
-        return self.eigvals, self.eigvecs, self.mass_matrix
+        L = -igl.cotmatrix(v, f)
+        mass_matrix = igl.massmatrix(v, f, igl.MASSMATRIX_TYPE_VORONOI)
+        eigvals, eigvecs = sp.linalg.eigsh(L, k=k, M=mass_matrix, sigma=sigma, which='LM')
+        return eigvals, eigvecs, mass_matrix
 
     
-    def compute_coefficients(self, lmax=15, ts=[0.1, 1, 10]):
+    def compute_coefficients(self, lmax=10, hks=True, ts=[0.1, 1, 10]):
         '''
-        Analyze optimized vertices using spherical harmonics.
+        Compute harmonics coefficients for
 
         Args:
             lmax (int): Maximum degree for the harmonics coefficients. Determines the number of eigenfunctions used (k = lmax**2).
@@ -53,15 +53,27 @@ class MeshHarm(SpHarm):
         self.lmax = lmax 
         k = int(lmax**2)
         self._eig_decomp(k=k)
-
-        hks = [] 
-        for t in ts:
-            hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
-        self.hks = np.array(hks).T 
-
-        self.coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ self.hks)
         self.coeffs_v = self.eigvecs.T @ (self.mass_matrix @ self.v)
-        return self.coeffs_hks, self.coeffs_v
+
+        if hks: 
+            hks = [] 
+            for t in ts:
+                hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
+            self.hks = np.array(hks).T 
+
+            self.coeffs_hks = self.eigvecs.T @ (self.mass_matrix @ self.hks)
+
+    def smooth_mesh(self, new_lmax=None):
+        '''
+        Smooth the mesh by only retaining low-frequency spherical harmonics.
+
+        Args:
+            new_lmax (int): New maximum degree for the harmonics coefficients.
+                Determines the number of eigenfunctions used (k = new_lmax**2).
+        '''
+        if new_lmax is not None: 
+            self.lmax = new_lmax
+        self.v = self.reconstruct_from_coeffs(self.coeffs_v, lmax=self.lmax)
 
     
     def compute_hks_for_new_times(self, new_ts=[1, 5, 10], coeffs=True):
@@ -105,7 +117,7 @@ class MeshHarm(SpHarm):
             lmax = self.lmax
         v_recon = self.reconstruct_from_coeffs(self.coeffs_v, lmax=lmax)
         diff = self.v - v_recon 
-        return np.sqrt(np.sum(diff**2))
+        return np.sqrt(np.sum(diff**2)/self.v.shape[0])/np.sqrt(self.mass_matrix.diagonal().sum())
 
     def save_results(self, path):
         """

@@ -4,13 +4,41 @@ import numpy as np
 import os 
 import anndata as ad
 import pandas as pd
+from collections import defaultdict
+
+def rerun_fatemarkers(mesh_path, save_path): 
+    m = FateMarkers()
+    m.load_results(save_path) 
+    # load mesh to get the scalar fields and recompute the coefficients 
+    m.load_mesh_from_file(mesh_path)  
+    m._refine_lgr5_marker()
+    m.align_with_pca()
+    m.compute_coefficients(lmax=15)
+    m.save_results(save_path)
 
 def run_fatemarkers(mesh_path, save_path): 
     m = FateMarkers()
-    m.load_mesh_from_file(mesh_path)  
+    m.load_mesh_from_file(mesh_path) 
+    m._refine_lgr5_marker() 
     m.align_with_pca() 
-    m.compute_coefficients(lmax=15)
+    m.precompute_eigens(lmax=15) 
+    m.compute_coefficients()
     m.save_results(save_path)
+
+def nested_dict():
+    return defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+def convert_to_dict(strings): 
+    tree = nested_dict()
+    for s in strings:
+        parts = s.split('_')
+        day = parts[0]
+        well_letter = parts[1][0]
+        well_number = parts[1][1:]
+        number = int(parts[2])
+        
+        tree[day][well_letter][well_number].append(number)
+    return tree 
 
 if __name__ == "__main__":
 
@@ -50,16 +78,7 @@ if __name__ == "__main__":
     'day4p5-more': ['0_fused_zillum_registered'],
     }
 
-    meshes = {
-        'day1p5': ['nnorg_linked_multi_annotated'],
-        'day2': ['nnorg_linked_multi_annotated'],
-        'day2p5': ['nnorg_linked_multi_annotated'],
-        'day3': ['nnorg_linked_multi_annotated'],
-        'day3p5': ['nnorg_linked_multi_annotated'],
-        'day4': ['nnorg_linked_multi_annotated'],
-        'day4p5': ['nnorg_linked_multi_annotated'],
-        'day4p5-more': ['nnorg_linked_multi_annotated'],
-    }
+    mesh_name = 'nnorg_linked_multi_annotated_class' 
 
     tables = {
         'day1p5':['cell_features'],
@@ -73,29 +92,36 @@ if __name__ == "__main__":
     }
 
     # this is where data are saved 
-    folder_path = 'Data/20250818/fractal_output/'
+    folder_path = 'Data/20251001/'
+    discard_label_path = 'Data/combined_labels_to_discard.npy'
+    discard_labels = np.load(discard_label_path)
+    discard_tree = convert_to_dict(discard_labels)
+
+
 
     for timepoint in timepoints:
         zarr_name = zarr_names[timepoint]
         for well_name in wells[timepoint]:
             round_name = rounds[timepoint][0]
             path = f"{folder_path}{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/"
-            labels = np.load(path + 'good_labels.npy').astype('int')
-            mesh_name = meshes[timepoint][0]
-            print(path) 
-            for label in tqdm(labels):
-                mesh_path = f"{folder_path}{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/meshes/{mesh_name}/{label}.vtp"
-                if not os.path.exists(mesh_path):
-                    print(f"Mesh file does not exist: {mesh_path}")
+            to_discard = discard_tree[timepoint][well_name[0]][well_name[1:]]
+            mesh_path = f"{folder_path}{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/meshes/{mesh_name}/"
+            all_labels = [int(l.split('.')[0]) for l in os.listdir(mesh_path)]
+            good_labels = [l for l in all_labels if l not in to_discard]
+            np.save(f"{path}/fm_data/good_labels.npy", np.array(good_labels))
+            for label in tqdm(good_labels):
+                mesh_file = f"{mesh_path}/{label}.vtp"
+                if not os.path.exists(mesh_file):
+                    print(f"Mesh file does not exist: {mesh_file}")
                     continue
                 save_path = f"{folder_path}{timepoint}/{zarr_name}/{well_name[0]}/{well_name[1:]}/{round_name}/fm_data"
                 if not os.path.exists(save_path):
                     os.mkdir(save_path)
-                save_path = f"{save_path}/{label}"
-                if not os.path.exists(save_path + '_coeffs.npz'):
-                    try: 
-                        run_fatemarkers(mesh_path, save_path)
-                    except Exception as e:
-                        print(f"Error processing mesh {mesh_path}: {e}")
-                        continue 
+                save_loc = f"{save_path}/{label}"
+                try: 
+                    run_fatemarkers(mesh_file, save_loc)
+                except Exception as e:
+                    print(f"Error processing mesh {mesh_file}: {e}")
+                    continue 
+
 
