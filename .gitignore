@@ -13,3 +13,6 @@ plot_coor.ipynb
 /sim/meshharm
 /sim/spharm
 /sim
+/Figures
+/ML/op_cache
+/ML/__pycache__

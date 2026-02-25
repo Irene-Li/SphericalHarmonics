@@ -103,12 +103,13 @@ class FateMarkers():
             self.fields.append(np.array(array))
         self.fields = np.array(self.fields).T  # Transpose to match vertices
 
-    def _refine_lgr5_marker(self): 
+    def _refine_lgr5_marker(self, sec_cell_names=None): 
         # Refine the LGR5 marker by averaging with neighbors
         lgr5_idx = self.field_names.index('0.C02.percentile99_class')
 
-        sec_cell_names = ['3.C03.percentile99_class', '1.C03.percentile99_class', 
-                          '2.C04.percentile99_class', '3.C02.percentile99_class', 
+        if sec_cell_names is None:
+            sec_cell_names = ['3.C03.percentile99_class', '1.C03.percentile99_class', 
+                              '2.C04.percentile99_class', '3.C02.percentile99_class', 
                           '2.C02.percentile99_class', '0.C03.percentile99_class',]
         secretory_cell_indices = [self.field_names.index(name) for name in sec_cell_names]
 
