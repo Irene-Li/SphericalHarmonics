@@ -1,6 +1,7 @@
 .DS_Store
-/.ipynb_checkpoints
-/__pycache__
+**/.ipynb_checkpoints
+**/__pycache__
+**/*.pyc
 /Data
 /igl_data
 data_analysis.ipynb
@@ -14,5 +15,19 @@ plot_coor.ipynb
 /sim/spharm
 /sim
 /Figures
+
+# ML experiment outputs (model weights, embeddings, operator caches)
 /ML/op_cache
 /ML/__pycache__
+DiffusionML/op_cache
+DiffusionML/**/op_cache
+DiffusionML/**/outputs
+DiffusionML/**/__pycache__
+
+# Generated data artifacts
+Data/small_meshes/sphere_cd_cache.json
+
+# Editor / tool state
+.claude/
+.polyscope.ini
+imgui.ini
