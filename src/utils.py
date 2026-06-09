@@ -1,8 +1,86 @@
+import os
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from matplotlib import pyplot as plt 
-import vtk 
+from matplotlib import pyplot as plt
+import vtk
+
+
+# ---------------------------------------------------------------------------
+# Dimensionality-reduction embeddings: save / load
+# ---------------------------------------------------------------------------
+
+def save_embedding(out_dir, name, xy, ids, method, **point_fields):
+    """Save a 2D embedding keyed by organoid id.
+
+    Args:
+        out_dir: directory to write into (created if missing).
+        name:    base filename, e.g. 'percentages_emb' -> {out_dir}/{name}.npz
+        xy:      (N, 2) embedding coordinates.
+        ids:     (N,) organoid id strings, aligned row-wise with xy.
+        method:  str, the reduction method used ('umap'/'tsne'/'pca'/'phate').
+        **point_fields: optional (N,) per-point arrays for colouring the
+                        scatter (e.g. times=, l_cross=, areas=).
+
+    Returns the written path.
+    """
+    xy = np.asarray(xy)
+    ids = np.asarray(ids)
+    assert xy.ndim == 2 and xy.shape[1] == 2, f"xy must be (N,2), got {xy.shape}"
+    assert xy.shape[0] == ids.shape[0], (
+        f"xy/ids length mismatch: {xy.shape[0]} vs {ids.shape[0]}")
+    for k, v in point_fields.items():
+        v = np.asarray(v)
+        assert v.shape[0] == ids.shape[0], (
+            f"point field '{k}' length {v.shape[0]} != n_ids {ids.shape[0]}")
+        point_fields[k] = v
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{name}.npz")
+    np.savez(path, xy=xy, ids=ids, method=str(method), name=str(name), **point_fields)
+    return path
+
+
+def load_embedding(path):
+    """Load an embedding saved by save_embedding into a plain dict."""
+    data = np.load(path, allow_pickle=True)
+    out = {k: data[k] for k in data.files}
+    # scalars stored as 0-d arrays -> python str
+    for k in ("method", "name"):
+        if k in out:
+            out[k] = str(out[k])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Organoid id -> on-disk mesh paths
+# ---------------------------------------------------------------------------
+
+def _parse_uid(uid):
+    """'day3p5_A01_42' -> (timepoint, well, label)."""
+    timepoint, well, label = uid.split("_")
+    return timepoint, well, label
+
+
+def _well_dir(uid, cfg):
+    """Common '{tp}/{zarr}/{well[0]}/{well[1:]}/{round}' fragment for a uid."""
+    timepoint, well, label = _parse_uid(uid)
+    zarr_name = cfg["zarr_names"][timepoint]
+    round_name = cfg["rounds"][timepoint]
+    return f"{timepoint}/{zarr_name}/{well[0]}/{well[1:]}/{round_name}", label
+
+
+def organoid_vtp_path(data_path, cfg, uid):
+    """Path to the original .vtp mesh (carries per-vertex fate fields)."""
+    frag, label = _well_dir(uid, cfg)
+    mesh_name = cfg["mesh_name"]
+    return f"{data_path}/fractal_output/{frag}/meshes/{mesh_name}/{label}.vtp"
+
+
+def organoid_obj_path(data_path, cfg, uid):
+    """Path to the saved PCA-transformed shape (.obj, geometry only)."""
+    frag, label = _well_dir(uid, cfg)
+    return f"{data_path}/fractal_output/{frag}/fm_data/{label}_transformed_mesh.obj"
 
 def read_stl(filename): 
     reader = vtk.vtkSTLReader()
