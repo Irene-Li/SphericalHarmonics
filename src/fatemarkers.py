@@ -26,6 +26,34 @@ class FateMarkers():
         pca.fit(self.v)
         self.v = pca.transform(self.v)
         self.transform_matrix = np.copy(pca.components_)
+        self._orient_axes()  # resolve PCA sign ambiguity
+        return self
+
+    def _orient_axes(self):
+        """Resolve the PCA sign ambiguity deterministically.
+
+        PCA centres the vertices, so the vertex centroid is at the origin and
+        carries no sign information. Instead, flip each principal axis so that
+        the centroid of the *enclosed solid* (its centre of mass) lies on the
+        positive side of that axis. Falls back to coordinate skewness if the
+        mesh is not watertight (near-zero signed volume).
+
+        Mirroring is allowed: the three axes are signed independently, so the
+        result may be a reflection (this is fine for shape inspection).
+        """
+        v, f = self.v, self.f
+        a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+        vol6 = np.einsum('ij,ij->i', a, np.cross(b, c))   # 6 * signed tet volume
+        V6 = vol6.sum()
+        if abs(V6) > 1e-6:
+            # centre of mass of the solid (tet centroids weighted by signed volume)
+            score = (vol6[:, None] * (a + b + c)).sum(axis=0) / (4.0 * V6)
+        else:
+            score = np.mean(v ** 3, axis=0)              # skewness fallback
+
+        signs = np.where(score >= 0, 1.0, -1.0)
+        self.v = self.v * signs[None, :]
+        self.transform_matrix = self.transform_matrix * signs[:, None]
         return self
 
     def load_mesh_from_file(self, path):

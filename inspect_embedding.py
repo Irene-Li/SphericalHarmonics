@@ -21,9 +21,9 @@ don't overlap.
 
 Run from the repository root, in the `scmpx` conda env:
 
-    /opt/homebrew/anaconda3/envs/scmpx/bin/python inspect_embedding.py \
-        --embedding Data/20260224/embeddings/percentages_emb.npz \
-        [--data_path Data/20260224] [--csv Data/cell_types_norm_neg.csv]
+    python inspect_embedding.py \
+        --embedding Data/20260224/embeddings/hks_emb.npz \
+        --data_path Data/20260224 --csv Data/cell_types_norm_neg.csv
 
 Click a point in the scatter to load that organoid. Close either window to quit.
 """
@@ -63,6 +63,9 @@ def main():
                     help="dataset root containing config.json + fractal_output/")
     ap.add_argument("--csv", default="Data/cell_types_norm_neg.csv",
                     help="cell-fate percentages CSV (indexed by label_uid)")
+    ap.add_argument("--vocab", default="sim/vocab_new.npz",
+                    help="HKS bag-of-features vocab; adds per-vertex 'vocab-k' "
+                         "overlays on the mesh (set to '' to disable)")
     args = ap.parse_args()
 
     # ---- load embedding -------------------------------------------------
@@ -90,6 +93,21 @@ def main():
         if uid in df.index:
             return np.nan_to_num(df.loc[uid, fate_cols].to_numpy(dtype=float))
         return np.zeros(len(fate_cols))
+
+    # ---- optional HKS bag-of-features vocabulary -----------------------
+    # Adds per-vertex 'vocab-k' overlays on the mesh, computed exactly like
+    # double_clustering's load_bof (HKS at the vocab time-scales -> soft-assign
+    # to each vocab word).
+    vocab = None
+    if args.vocab and os.path.exists(args.vocab):
+        vr = np.load(args.vocab, allow_pickle=True)
+        vocab = {"words": vr["vocab"],
+                 "sigma": float(np.ravel(vr["sigma"])[0]),
+                 "scaler": vr["scaler"].item(),
+                 "ts": np.ravel(vr["ts"])}
+        print(f"Loaded HKS vocab from {args.vocab} ({vocab['words'].shape[0]} words)")
+    elif args.vocab:
+        print(f"No vocab at {args.vocab} -- skipping vocab overlays")
 
     # per-organoid fate percentages aligned to the embedding ids.
     # Colour on a log scale with a shared range across fates, as in the notebook.
@@ -134,6 +152,8 @@ def main():
             m = FateMarkers()
             if os.path.exists(vtp):
                 m.load_mesh_from_file(vtp)
+                m._refine_lgr5_marker()  # match the rerun_fm / coeffs pipeline
+                m.align_with_pca()       # canonical PCA pose, matching the coeffs frame
                 v, f, fields, field_names = m.v, m.f, m.fields, m.field_names
             elif os.path.exists(obj):
                 import igl
@@ -152,6 +172,25 @@ def main():
                 friendly = field_to_friendly.get(fld, fld)
                 org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis",
                                         enabled=(friendly == DEFAULT_MARKER))
+
+        # per-vertex HKS vocab encoding (uses the saved eigendecomposition)
+        if vocab is not None:
+            try:
+                cf = np.load(utils.organoid_coeffs_path(args.data_path, cfg, uid))
+                eigvecs = cf["eigvecs"]
+                if eigvecs.shape[0] != v.shape[0]:
+                    raise ValueError(f"eigvec/vertex mismatch "
+                                     f"({eigvecs.shape[0]} vs {v.shape[0]})")
+                m.eigvals, m.eigvecs = cf["eigvals"], eigvecs
+                hks = m.compute_hks_for_new_times(vocab["ts"], coeffs=False)
+                hks_s = vocab["scaler"].transform(hks / np.mean(hks, axis=0) - 1)
+                dist = np.linalg.norm(hks_s[:, None, :] - vocab["words"][None, :, :], axis=2)
+                enc = np.exp(-dist ** 2 / (2 * vocab["sigma"] ** 2))   # (nverts, n_words)
+                for k in range(enc.shape[1]):
+                    org.add_scalar_quantity(f"vocab-{k}", enc[:, k], cmap="viridis")
+            except Exception as e:
+                print(f"  [warn] vocab overlay failed for {uid}: {e}")
+
         org.reset_transform()
         state["org"] = org
         ps.reset_camera_to_home_view()

@@ -82,6 +82,12 @@ def organoid_obj_path(data_path, cfg, uid):
     frag, label = _well_dir(uid, cfg)
     return f"{data_path}/fractal_output/{frag}/fm_data/{label}_transformed_mesh.obj"
 
+
+def organoid_coeffs_path(data_path, cfg, uid):
+    """Path to the saved per-organoid coefficients/eigendecomposition npz."""
+    frag, label = _well_dir(uid, cfg)
+    return f"{data_path}/fractal_output/{frag}/fm_data/{label}_coeffs.npz"
+
 def read_stl(filename): 
     reader = vtk.vtkSTLReader()
     reader.SetFileName(filename)
