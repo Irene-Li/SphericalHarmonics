@@ -13,16 +13,30 @@ Arrays saved (filtered to the 95th-percentile recon-quality threshold):
   fate_names          (n_fates,)        ordered fate marker names
   fm_coeffs           (N, n_modes², n_fates)   sph-harm coefficients of FM fields
   hks_coeffs_sparse   (N, n_modes², 4)          HKS coeffs at ts = [1, 4, 25, 100]
-  hks_bof_coeffs      (N, n_modes², n_vocab)    BoF-encoded HKS  (only if vocab found)
-  hks_bof_ts          (n_ts_vocab,)              time-scale values used for BoF
+
+  For each configured vocabulary (see VOCABS below), one array:
+  hks_bof_coeffs__<name>  (N, n_modes², n_features)   HKS encoded with that vocab
+  bof_vocab_names         (n_vocabs,)                 ordered vocab names
+
+Each vocabulary encodes the per-vertex heat-kernel signature (HKS) and projects
+the encoding onto the spherical-harmonic modes. Two encoding types are supported:
+
+  kmeans : soft bag-of-features assignment to KMeans cluster centres
+           encoding[v, w] = exp(-||hks_v - centre_w||² / 2σ²)
+  pca    : projection (coefficients) onto the leading PCA components
+           encoding[v, c] = (hks_v - mean) · component_c
+
+Time rescaling: 'variable'-time vocabs compute the HKS at organoid-specific
+time scales ts = exp(2·linspace(0, log(sqrt(area)), 20)) with the LB eigvecs
+rescaled to unit area (eigvecs·sqrt(area)) — matching how the vocab was trained
+in bag_of_features.ipynb. 'fixed'-time vocabs use the stored `ts` array.
 
 Usage:
-  python compute_master_npz.py [data_path] [vocab_path] [out_path]
+  python compute_master_npz.py [data_path] [out_path]
 
 Defaults:
   data_path  = Data/20260224
-  vocab_path = sim/vocab_new.npz
-  out_path   = sim/master.npz
+  out_path   = {data_path}/master.npz
 """
 
 import os
@@ -39,13 +53,21 @@ from src.fatemarkers import FateMarkers
 # ---------------------------------------------------------------------------
 
 data_path  = sys.argv[1] if len(sys.argv) > 1 else "Data/20260224"
-vocab_path = sys.argv[2] if len(sys.argv) > 2 else "sim/vocab_new.npz"
-out_path   = sys.argv[3] if len(sys.argv) > 3 else f"{data_path}/master.npz"
+out_path   = sys.argv[2] if len(sys.argv) > 2 else f"{data_path}/master.npz"
 
 SPARSE_TS           = [1, 4, 25, 100]
 COMPLEXITY_LMAX     = 9
 FRAC_PERCENTILE     = 95
 L_CROSS_THRESHOLD   = 0.015
+N_VARIABLE_TS       = 20    # number of organoid-specific time scales
+
+# Vocabularies to encode against. Each produces an `hks_bof_coeffs__<name>` array.
+VOCABS = [
+    {"name": "kmeans_variable", "path": "sim/vocab_variable_time.npz",
+     "encoding": "kmeans", "time": "variable"},
+    {"name": "pca_variable",    "path": "sim/vocab_pca_variable_time.npz",
+     "encoding": "pca",    "time": "variable"},
+]
 
 with open(f"{data_path}/config.json") as f:
     cfg = json.load(f)
@@ -58,20 +80,43 @@ annotation_names = cfg["annotation_names"]
 correct_order    = list(annotation_names.keys())
 
 # ---------------------------------------------------------------------------
-# Optionally load HKS vocabulary
+# Load HKS vocabularies
 # ---------------------------------------------------------------------------
 
-vocab = None
-if os.path.exists(vocab_path):
-    res        = np.load(vocab_path, allow_pickle=True)
-    vocab_hks  = res["vocab"]
-    sigma_hks  = res["sigma"]
-    scaler_hks = res["scaler"].item()
-    ts_vocab   = res["ts"]
-    vocab      = True
-    print(f"Loaded HKS vocab from {vocab_path}  (n_words={vocab_hks.shape[0]})")
-else:
-    print(f"Vocab not found at {vocab_path} — skipping BoF HKS encoding")
+def find_times(area, n=N_VARIABLE_TS):
+    """Organoid-specific HKS time scales (matches bag_of_features.ipynb)."""
+    final_time = np.sqrt(area)
+    return np.exp(2 * np.linspace(0, np.log(final_time), n))
+
+
+def load_vocab(spec):
+    res = np.load(spec["path"], allow_pickle=True)
+    v = dict(spec)
+    v["scaler"] = res["scaler"].item()
+    if spec["encoding"] == "kmeans":
+        v["centres"] = res["vocab"]            # (n_words, n_t)
+        v["sigma"]   = float(res["sigma"])
+        v["n_features"] = v["centres"].shape[0]
+    elif spec["encoding"] == "pca":
+        v["components"] = res["components"]    # (n_comp, n_t)
+        v["mean"]       = res["mean"]          # (n_t,)
+        v["n_features"] = v["components"].shape[0]
+    else:
+        raise ValueError(f"Unknown encoding {spec['encoding']!r}")
+    if spec["time"] == "fixed":
+        v["ts"] = res["ts"]
+    return v
+
+
+vocabs = []
+for spec in VOCABS:
+    if os.path.exists(spec["path"]):
+        v = load_vocab(spec)
+        vocabs.append(v)
+        print(f"Loaded vocab '{v['name']}' ({v['encoding']}, {v['time']} time) "
+              f"from {spec['path']}  n_features={v['n_features']}")
+    else:
+        print(f"Vocab '{spec['name']}' not found at {spec['path']} — skipping")
 
 # ---------------------------------------------------------------------------
 # Per-organoid feature extraction
@@ -81,14 +126,43 @@ def compute_complexity_errors(m):
     return np.array([m.compute_recon_quality(lmax=l) for l in range(1, COMPLEXITY_LMAX + 1)])
 
 
-def compute_hks_bof(m):
-    hks        = m.compute_hks_for_new_times(ts_vocab, coeffs=False)
-    hks_scaled = scaler_hks.transform(hks / np.mean(hks, axis=0) - 1)
-    dist       = np.linalg.norm(
-        hks_scaled[:, np.newaxis, :] - vocab_hks[np.newaxis, :, :], axis=2
-    )
-    encoding   = np.exp(-dist**2 / (2 * sigma_hks**2))
-    return m.modes.T @ (m.mass_matrix @ encoding)
+def hks_unit_area(m, ts):
+    """Per-vertex HKS at the given times with unit-area eigvecs, then the
+    per-time mean-removal used during vocab training."""
+    eigvecs = m.eigvecs * np.sqrt(m.area)
+    hks = np.array([
+        np.einsum('i, ji->j', np.exp(-m.eigvals * t), eigvecs ** 2)
+        for t in ts
+    ]).T
+    return hks / np.mean(hks, axis=0) - 1
+
+
+def encode_vocab(hks_scaled, v):
+    if v["encoding"] == "kmeans":
+        dist = np.linalg.norm(
+            hks_scaled[:, np.newaxis, :] - v["centres"][np.newaxis, :, :], axis=2
+        )
+        return np.exp(-dist**2 / (2 * v["sigma"]**2))
+    else:  # pca — projection (coefficients) onto leading components
+        return (hks_scaled - v["mean"]) @ v["components"].T
+
+
+def compute_bof_coeffs(m):
+    """Return {vocab_name: (n_modes, n_features)} sph-harm coeffs for every vocab.
+
+    The raw HKS is cached per time-array so vocabs sharing a time scheme
+    (e.g. all 'variable' vocabs of one organoid) only compute it once."""
+    hks_cache = {}
+    out = {}
+    for v in vocabs:
+        ts  = find_times(m.area) if v["time"] == "variable" else np.asarray(v["ts"])
+        key = ts.tobytes()
+        if key not in hks_cache:
+            hks_cache[key] = hks_unit_area(m, ts)
+        hks_scaled = v["scaler"].transform(hks_cache[key])
+        encoding   = encode_vocab(hks_scaled, v)
+        out[v["name"]] = m.modes.T @ (m.mass_matrix @ encoding)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +177,7 @@ fracs_raw      = []
 complexity_raw = []
 fm_coeffs_raw  = []
 hks_sparse_raw = []
-hks_bof_raw    = []
+bof_raw        = {v["name"]: [] for v in vocabs}
 
 for timepoint in timepoints:
     zarr_name  = zarr_names[timepoint]
@@ -131,8 +205,9 @@ for timepoint in timepoints:
                     complexity_raw.append(compute_complexity_errors(m))
                     fm_coeffs_raw.append(m.coeffs_fm[:, fate_indices])
                     hks_sparse_raw.append(m.compute_hks_for_new_times(SPARSE_TS))
-                    if vocab:
-                        hks_bof_raw.append(compute_hks_bof(m))
+                    if vocabs:
+                        for name, coeffs in compute_bof_coeffs(m).items():
+                            bof_raw[name].append(coeffs)
 
                 except Exception as e:
                     print(f"Failed {save_path}: {e}")
@@ -173,9 +248,10 @@ save_kwargs = dict(
     hks_coeffs_sparse = np.array(hks_sparse_raw)[mask],
 )
 
-if vocab:
-    save_kwargs["hks_bof_coeffs"] = np.array(hks_bof_raw)[mask]
-    save_kwargs["hks_bof_ts"]     = ts_vocab
+if vocabs:
+    save_kwargs["bof_vocab_names"] = np.array([v["name"] for v in vocabs])
+    for v in vocabs:
+        save_kwargs[f"hks_bof_coeffs__{v['name']}"] = np.array(bof_raw[v["name"]])[mask]
 
 os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 np.savez(out_path, **save_kwargs)
