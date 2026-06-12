@@ -36,6 +36,8 @@ import sys
 import numpy as np
 import polyscope as ps
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.colors import BoundaryNorm, ListedColormap, Normalize
 from matplotlib.widgets import RadioButtons
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +78,8 @@ def main():
     times = emb["times"].astype(str) if "times" in emb else np.array(["?"] * len(ids))
     l_cross = emb["l_cross"].astype(float) if "l_cross" in emb else np.full(len(ids), np.nan)
     areas = emb["areas"].astype(float) if "areas" in emb else np.full(len(ids), np.nan)
+    # optional per-point shape-cluster labels (saved on the shape embedding)
+    shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
 
     # ---- config + fate-name map ----------------------------------------
@@ -123,10 +127,33 @@ def main():
     color_fields = {"l_cross": (l_cross, "Greens", (1, 8)),
                     "area":    (areas,   "Blues",  None),
                     "time":    (tcode,   "viridis", None)}
+
+    # lgr/sero/lyz presence-absence combo (8-way categorical label from the fate CSV)
+    def _frac(uid, name):
+        col = f"{name}.cnt_exclusive"
+        return float(df.loc[uid, col]) if (uid in df.index and col in df.columns) else 0.0
+    combo = np.array([f"lgr{'+' if _frac(u, 'LGR') > 0 else '-'} "
+                      f"sero{'+' if _frac(u, 'SERO') > 0 else '-'} "
+                      f"lyz{'+' if _frac(u, 'LYZ') > 0 else '-'}" for u in ids])
+    combo_levels = sorted(set(combo))
+    combo_codes = np.array([combo_levels.index(c) for c in combo], dtype=float)
+    color_fields["fate_combo"] = (combo_codes, "tab10", (0, max(1, len(combo_levels) - 1)))
+
+    # categorical fields -> (code, label) pairs to annotate the colorbar
+    cat_levels = {"fate_combo": list(enumerate(combo_levels))}
+
     for j, lab in enumerate(fate_labels):
         color_fields[lab] = (log_perc[:, j], "Reds", (log_lo, log_hi))
-    color_options = ["l_cross", "area", "time"] + list(fate_labels)
+    color_options = ["l_cross", "area", "time", "fate_combo"] + list(fate_labels)
     fate_set = set(fate_labels)
+
+    # shape-cluster colouring (only present on the shape embedding)
+    if shape_clusters is not None:
+        color_fields["shape_cluster"] = (shape_clusters, "tab10",
+                                         (shape_clusters.min(), shape_clusters.max()))
+        color_options.insert(3, "shape_cluster")
+        uniq_cl = sorted(set(shape_clusters.astype(int)))
+        cat_levels["shape_cluster"] = [(c, f"cluster {c}") for c in uniq_cl]
 
     state = {"org": None}
 
@@ -202,10 +229,12 @@ def main():
     fig.canvas.manager.set_window_title("Embedding")
     ax_radio = fig.add_axes([0.005, 0.08, 0.085, 0.86], frameon=True)  # color selector
     ax = fig.add_axes([0.16, 0.10, 0.46, 0.82])      # scatter
-    ax_bar = fig.add_axes([0.71, 0.10, 0.27, 0.82])  # fate % bar
+    ax_bar = fig.add_axes([0.82, 0.10, 0.16, 0.82])  # fate % bar
+
+    markersize = 5
 
     init_c, init_cmap, _ = color_fields["l_cross"]
-    sc = ax.scatter(xy[:, 0], xy[:, 1], c=init_c, cmap=init_cmap, s=14, alpha=0.85)
+    sc = ax.scatter(xy[:, 0], xy[:, 1], c=init_c, cmap=init_cmap, s=markersize, alpha=0.85)
     hl = ax.scatter([], [], s=160, facecolors="none", edgecolors="red", linewidths=2,
                     zorder=6)
     cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
@@ -222,15 +251,29 @@ def main():
         c, cmap, clim = color_fields[field]
         c = np.asarray(c, float)
         sc.set_array(c)
-        sc.set_cmap(cmap)
-        if clim is not None:
-            sc.set_clim(*clim)
+        if field in cat_levels:
+            # discrete colormap: one solid colour band per class (codes 0..n-1)
+            codes, labels = zip(*cat_levels[field])
+            n = len(codes)
+            base = plt.get_cmap("tab10" if n <= 10 else "tab20")
+            disc = ListedColormap([base(i % base.N) for i in range(n)])
+            sc.set_cmap(disc)
+            sc.set_norm(BoundaryNorm(np.arange(n + 1) - 0.5, n))
+            cbar.update_normal(sc)
+            cbar.set_ticks(list(codes))
+            cbar.set_ticklabels(list(labels))
         else:
-            finite = np.isfinite(c)
-            if finite.any():
-                sc.set_clim(np.min(c[finite]), np.max(c[finite]))
+            sc.set_cmap(cmap)
+            if clim is not None:
+                lo, hi = clim
+            else:
+                finite = np.isfinite(c)
+                lo, hi = (np.min(c[finite]), np.max(c[finite])) if finite.any() else (0, 1)
+            sc.set_norm(Normalize(lo, hi))
+            cbar.update_normal(sc)
+            cbar.locator = mticker.AutoLocator()
+            cbar.update_ticks()
         cbar.set_label(f"log({field}+1e-3)" if field in fate_set else field)
-        cbar.update_normal(sc)
         fig.canvas.draw_idle()
     radio.on_clicked(recolor)
     recolor("l_cross")   # apply the notebook clim/label to the initial view
