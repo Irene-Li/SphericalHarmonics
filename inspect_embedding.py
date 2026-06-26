@@ -17,8 +17,18 @@ The scatter can be colored by l_cross / area / time or by any fate marker's
 percentage (the l=0 harmonic coefficient saved on the embedding as 'perc_<name>'
 point-fields by double_clustering.ipynb; log scale, shared range).
 
-Organoid ids are dataset-prefixed ('{dataset}_{timepoint}_{well}_{label}'); each
-mesh is loaded from '{data_root}/{dataset}' using that dataset's own config.json.
+Self-contained: this viewer needs only the embedding .npz and the original .vtp
+meshes — no pipeline outputs (no per-organoid coeffs/eigendecomposition, no
+transformed .obj). Point --data_root at any folder containing the .vtp files;
+they are found by filename regardless of how they're nested, so you can just
+drop the original meshes there. Each .vtp already carries the per-vertex fate
+fields, which are shown on the mesh.
+
+Organoid ids are dataset-prefixed ('{dataset}_{timepoint}_{well}_{label}'); the
+trailing '{timepoint}_{well}_{label}' is the .vtp filename stem used to find the
+mesh. If a dataset's config.json is present next to the meshes it is used (and
+auto-discovered) to give the fate fields friendly names; otherwise the raw vtp
+field names are shown.
 
 Opens two separate windows (scatter + organoid); drag them apart so they
 don't overlap.
@@ -26,7 +36,7 @@ don't overlap.
 Run from the repository root, in the `scmpx` conda env:
 
     python inspect_embedding.py \
-        --embedding Data/embeddings/hks_full_emb.npz --data_root Data
+        --embedding Data/embeddings/hks_emb.npz --data_root Data
 
 Click a point in the scatter to load that organoid. Close either window to quit.
 """
@@ -66,12 +76,8 @@ def main():
     ap.add_argument("--embedding", required=True,
                     help="path to an embedding .npz (from utils.save_embedding)")
     ap.add_argument("--data_root", default="Data",
-                    help="parent dir of the dataset folders. Organoid ids of the form "
-                         "'{dataset}_{timepoint}_{well}_{label}' are resolved to "
-                         "'{data_root}/{dataset}', each with its own config.json.")
-    ap.add_argument("--vocab", default="sim/vocab_new.npz",
-                    help="HKS bag-of-features vocab; adds per-vertex 'vocab-k' "
-                         "overlays on the mesh (set to '' to disable)")
+                    help="folder to search (recursively) for the original .vtp "
+                         "meshes. Meshes are found by filename, so any layout works.")
     args = ap.parse_args()
 
     # ---- load embedding -------------------------------------------------
@@ -86,52 +92,86 @@ def main():
     shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
 
-    # ---- per-dataset config resolution ---------------------------------
-    # Ids are dataset-prefixed ('{dataset}_{bare_uid}').  Dataset names may
-    # contain underscores (e.g. 'main_dataset'), so we prefix-match against
-    # the actual folders present under data_root rather than splitting blindly.
-    known_datasets = sorted(
-        d for d in os.listdir(args.data_root)
-        if os.path.isfile(os.path.join(args.data_root, d, "config.json")))
-    print(f"Known datasets: {known_datasets}")
+    # ---- locate the original .vtp meshes -------------------------------
+    # Build a {filename-stem: [paths]} index by walking data_root once.  The
+    # collaborator only needs to drop the original .vtp files somewhere under
+    # data_root; the exact nesting doesn't matter.  An embedding id is the
+    # dataset name followed by the mesh's filename stem
+    # ('main_dataset' + '_' + 'day2p5_A04_67'), so a mesh is found by matching
+    # the longest trailing part of the id against an indexed stem.
+    vtp_index = {}
+    for root, _dirs, files in os.walk(args.data_root):
+        for fn in files:
+            if fn.endswith(".vtp"):
+                vtp_index.setdefault(fn[:-4], []).append(os.path.join(root, fn))
+    n_vtp = sum(len(v) for v in vtp_index.values())
+    print(f"Indexed {n_vtp} .vtp files under {args.data_root}")
+    if n_vtp == 0:
+        print(f"  [warn] no .vtp meshes found under {args.data_root!r} — "
+              f"meshes won't load. Pass --data_root <folder with the .vtp files>.")
 
-    # short prefix per dataset: first letter of each '_'-separated word, e.g.
-    # 'main_dataset' -> 'md', 'sup_dataset' -> 'sd'
-    _ds_short = {"_".join(w): "".join(w[0] for w in ds.split("_"))
-                 for ds in known_datasets
-                 for w in [ds.split("_")]}
+    def resolve_vtp(full_id):
+        """Map an embedding id to a .vtp path (or None if not found).
+
+        Tries progressively shorter trailing parts of the id ('a_b_c_d' ->
+        'b_c_d' -> 'c_d' ...) and returns the first that is an indexed stem;
+        if several files share that stem, prefers one whose path contains the
+        leading dataset prefix.
+        """
+        toks = full_id.split("_")
+        for i in range(len(toks)):
+            stem = "_".join(toks[i:])
+            cands = vtp_index.get(stem)
+            if not cands:
+                continue
+            if len(cands) == 1:
+                return cands[0]
+            prefix = "_".join(toks[:i])
+            for p in cands:
+                if prefix and prefix in p.replace(os.sep, "_"):
+                    return p
+            return cands[0]
+        return None
 
     def shorten_id(full_id):
-        """'main_dataset_day1p5_A01_42' -> 'md_1p5_a01_42'"""
-        for ds in known_datasets:
-            if full_id.startswith(ds + "_"):
-                bare = full_id[len(ds) + 1:]          # 'day1p5_A01_42'
-                parts = bare.split("_")
-                tp = parts[0].lstrip("day")            # '1p5'
-                rest = "_".join(parts[1:]).lower()     # 'a01_42'
-                return f"{_ds_short[ds]}_{tp}_{rest}"
+        """'main_dataset_day1p5_A01_42' -> 'md_1p5_a01_42' (cosmetic title)."""
+        toks = full_id.split("_")
+        for i, t in enumerate(toks):
+            if t.startswith("day"):
+                ds = "".join(w[0] for w in toks[:i]) or "?"
+                rest = "_".join(toks[i + 1:]).lower()
+                return f"{ds}_{t[len('day'):]}_{rest}"
         return full_id
 
-    def split_uid(full):
-        """(data_path, bare_uid) for a dataset-prefixed id."""
-        for ds in known_datasets:
-            if full.startswith(ds + "_"):
-                return os.path.join(args.data_root, ds), full[len(ds) + 1:]
-        raise ValueError(f"Cannot determine dataset for id: {full!r}")
-
+    # ---- optional config.json for friendly fate names ------------------
+    # config.json is not required.  If one sits next to (or above) a mesh, it
+    # is used to combine/exclude markers and rename the raw vtp fields to
+    # friendly names; otherwise the raw field names are shown.
     _cfg_cache = {}
+    _root_abs = os.path.abspath(args.data_root)
 
-    def load_cfg(data_path):
-        """(cfg, field_to_friendly) for a dataset, cached."""
-        if data_path not in _cfg_cache:
-            with open(f"{data_path}/config.json") as fh:
-                cfg = json.load(fh)
-            f2f = {}
-            for name, flds in cfg["annotation_names"].items():
-                for fl in ([flds] if isinstance(flds, str) else flds):
-                    f2f[fl] = name
-            _cfg_cache[data_path] = (cfg, f2f)
-        return _cfg_cache[data_path]
+    def find_cfg(vtp_path):
+        """(cfg_or_None, field_to_friendly) by searching up from a mesh path."""
+        d = os.path.dirname(os.path.abspath(vtp_path))
+        if d in _cfg_cache:
+            return _cfg_cache[d]
+        cur, result = d, (None, {})
+        while True:
+            cfg_path = os.path.join(cur, "config.json")
+            if os.path.isfile(cfg_path):
+                with open(cfg_path) as fh:
+                    cfg = json.load(fh)
+                f2f = {}
+                for name, flds in cfg.get("annotation_names", {}).items():
+                    for fl in ([flds] if isinstance(flds, str) else flds):
+                        f2f[fl] = name
+                result = (cfg, f2f)
+                break
+            if os.path.normpath(cur) == _root_abs or cur == os.path.dirname(cur):
+                break
+            cur = os.path.dirname(cur)
+        _cfg_cache[d] = result
+        return result
 
     # ---- fate percentages from the embedding ---------------------------
     # double_clustering saves each fate as a 'perc_<name>' point-field: the
@@ -143,21 +183,6 @@ def main():
     log_perc = np.log(perc_matrix + 1e-3)
     log_lo, log_hi = ((float(log_perc.min()), float(log_perc.max()))
                       if fate_labels else (0.0, 1.0))
-
-    # ---- optional HKS bag-of-features vocabulary -----------------------
-    # Adds per-vertex 'vocab-k' overlays on the mesh, computed exactly like
-    # double_clustering's load_bof (HKS at the vocab time-scales -> soft-assign
-    # to each vocab word).
-    vocab = None
-    if args.vocab and os.path.exists(args.vocab):
-        vr = np.load(args.vocab, allow_pickle=True)
-        vocab = {"words": vr["vocab"],
-                 "sigma": float(np.ravel(vr["sigma"])[0]),
-                 "scaler": vr["scaler"].item(),
-                 "ts": np.ravel(vr["ts"])}
-        print(f"Loaded HKS vocab from {args.vocab} ({vocab['words'].shape[0]} words)")
-    elif args.vocab:
-        print(f"No vocab at {args.vocab} -- skipping vocab overlays")
 
     # timepoints -> numeric code for coloring
     uniq_t = sorted(set(times))
@@ -236,65 +261,34 @@ def main():
     ps.set_navigation_style("turntable")
 
     def load_organoid(idx):
-        data_path, uid = split_uid(ids[idx])
-        cfg, field_to_friendly = load_cfg(data_path)
+        full_id = ids[idx]
         if state["org"] is not None:
             state["org"].remove()
             state["org"] = None
 
-        flat = cfg.get("layout") == "vtp_flat"
-        if flat:
-            vtp    = utils.vtp_flat_path(data_path, cfg, uid)
-            obj    = utils.vtp_flat_obj_path(data_path, cfg, uid)
-            c_path = utils.vtp_flat_coeffs_path(data_path, cfg, uid)
-        else:
-            vtp    = utils.organoid_vtp_path(data_path, cfg, uid)
-            obj    = utils.organoid_obj_path(data_path, cfg, uid)
-            c_path = utils.organoid_coeffs_path(data_path, cfg, uid)
-
-        fields, field_names = None, None
+        vtp = resolve_vtp(full_id)
+        if vtp is None:
+            print(f"  [warn] no .vtp found for {full_id} under {args.data_root}")
+            return
         try:
             m = FateMarkers()
-            if os.path.exists(vtp):
-                m.load_mesh_from_file(vtp)
-                m._refine_markers(cfg["annotation_names"], cfg["exclusion_rules"])
-                m.align_with_pca()
-                v, f, fields, field_names = m.v, m.f, m.fields, m.field_names
-            elif os.path.exists(obj):
-                import igl
-                v, f = igl.read_triangle_mesh(obj)
-            else:
-                print(f"  [warn] no mesh found for {uid}")
-                return
+            m.load_mesh_from_file(vtp)
+            cfg, field_to_friendly = find_cfg(vtp)
+            if cfg is not None and cfg.get("annotation_names"):
+                m._refine_markers(cfg["annotation_names"], cfg.get("exclusion_rules", {}))
+            m.align_with_pca()
+            v, f, fields, field_names = m.v, m.f, m.fields, m.field_names
         except Exception as e:
-            print(f"  [warn] failed to load {uid}: {e}")
+            print(f"  [warn] failed to load {full_id} from {vtp}: {e}")
             return
 
         org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(v), f, smooth_shade=True,
                                        color=(0.55, 0.65, 0.85))
-        if fields is not None:
+        if fields is not None and len(field_names):
             for i, fld in enumerate(field_names):
                 friendly = field_to_friendly.get(fld, fld)
                 org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis",
                                         enabled=(friendly == DEFAULT_MARKER))
-
-        # per-vertex HKS vocab encoding (uses the saved eigendecomposition)
-        if vocab is not None:
-            try:
-                cf = np.load(c_path)
-                eigvecs = cf["eigvecs"]
-                if eigvecs.shape[0] != v.shape[0]:
-                    raise ValueError(f"eigvec/vertex mismatch "
-                                     f"({eigvecs.shape[0]} vs {v.shape[0]})")
-                m.eigvals, m.eigvecs = cf["eigvals"], eigvecs
-                hks = m.compute_hks_for_new_times(vocab["ts"], coeffs=False)
-                hks_s = vocab["scaler"].transform(hks / np.mean(hks, axis=0) - 1)
-                dist = np.linalg.norm(hks_s[:, None, :] - vocab["words"][None, :, :], axis=2)
-                enc = np.exp(-dist ** 2 / (2 * vocab["sigma"] ** 2))   # (nverts, n_words)
-                for k in range(enc.shape[1]):
-                    org.add_scalar_quantity(f"vocab-{k}", enc[:, k], cmap="viridis")
-            except Exception as e:
-                print(f"  [warn] vocab overlay failed for {uid}: {e}")
 
         org.reset_transform()
         state["org"] = org
