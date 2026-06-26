@@ -1,42 +1,55 @@
 #!/usr/bin/env python3
 """
-Builds and maintains combined_labels_to_discard.npy for a dataset.
+Builds and maintains labels_to_discard.csv for a dataset.
 
 Organoid ids in that file are excluded from processing by run_new_meshes.py
-and rerun_fm.py.
+(its config 'discard.labels_to_discard_csv' points here).
 
 ============================================================
-CONFIGURATION  (edit these two lines at the top of the file)
+CONFIGURATION
 ============================================================
 
-  FOLDER          dataset root — where manual_discards.txt and
-                  combined_labels_to_discard.npy are written.
+  --dataset              dataset root (holds export_status.csv). Defaults to
+                         Data/main_dataset; pass Data/sup_dataset to manage the
+                         supplementary dataset's discard list instead.
+  FEATURES_DIR           {dataset}/feature_tables: holds mesh_features.csv +
+                         manual_discards.txt; labels_to_discard.csv is written
+                         here too. A dataset without mesh_features.csv (e.g.
+                         sup_dataset) simply has no auto-derived discards — its
+                         labels_to_discard.csv is built from manual_discards.txt.
+  CORRECTED_TIMEPOINTS   timepoints that were hand-corrected — their organoids
+                         are never discarded (excluded from the output).
 
-  FEATURES_PATH   folder containing the feature CSVs
-                  (mesh_features.csv  and  organoids_to_discard.csv)
+The discard list is keyed to the dataset's OWN label_uids — it is rebuilt from
+`mesh_features.csv` (which shares the export's labels) intersected with the set
+of actually-exported organoids (`export_status.csv`), so the list only ever
+references meshes that exist.
 
 ============================================================
-TWO SOURCES
+THREE INGREDIENTS
 ============================================================
 
-  1. Auto-derived — read from FEATURES_PATH on every run:
+  1. Auto-derived — read from mesh_features.csv on every run:
        • sphericity > --sphericity-tol (default 1.3)
          organoids with an irregular / fused shape
-       • C01 (DAPI) min-intensity == 0
-         segmentation mask extends outside the imaged region
 
-  2. Hand-coded — stored in {folder}/manual_discards.txt:
+  2. Hand-coded — stored in {FEATURES_DIR}/manual_discards.txt:
        organoids you want to exclude for any other reason
-       (e.g. identified visually via the polyscope inspector)
+       (e.g. identified visually via the polyscope inspector). One id per line;
+       a trailing '_mesh.obj' is stripped.
 
-  combined_labels_to_discard.npy  =  auto ∪ manual
+  3. Corrected timepoints — CORRECTED_TIMEPOINTS:
+       hand-corrected timepoints whose organoids are kept regardless.
+
+  labels_to_discard.csv = ((auto − corrected-timepoints) ∪ manual) ∩ exported
+  Manual discards survive the corrected-timepoints filter; auto discards do not.
   It is rebuilt from scratch every time any command runs.
 
 ============================================================
 COMMANDS
 ============================================================
 
-  update  -- rebuild the .npy from feature tables + manual list
+  update  -- rebuild the .csv from mesh_features + manual list
   list    -- print every discarded id with its source
   add     -- add one or more ids to the manual list
   remove  -- remove one or more ids from the manual list
@@ -46,98 +59,125 @@ COMMANDS
 EXAMPLES
 ============================================================
 
-  # initial build
   python manage_discards.py update
-
-  # stricter sphericity cutoff
   python manage_discards.py update --sphericity-tol 1.2
-
-  # found a bad organoid in the inspector
+  python manage_discards.py update --dataset Data/sup_dataset
   python manage_discards.py add day3p5_A01_42
-
-  # bulk-import previously deleted meshes
+  python manage_discards.py add day4p5_B07_78 --dataset Data/sup_dataset
   python manage_discards.py import deleted.txt
-
-  # remove a mistakenly added id
   python manage_discards.py remove day3p5_A01_42
-
-  # see everything with source labels (auto / manual / auto+manual)
   python manage_discards.py list
 """
 
 import sys
 import os
+import csv
 import argparse
-import numpy as np
 
-FOLDER         = "Data/20260224/"
-FEATURES_PATH  = "Data/20251001/features"
+DEFAULT_DATASET = "Data/main_dataset"
 
-MANUAL_FILE    = "discard.txt"
-COMBINED_FILE  = "combined_labels_to_discard.npy"
+CORRECTED_TIMEPOINTS = ["day4p5", "day4p5-more"]
+
+# Path globals; populated by configure_paths() from the --dataset argument.
+DATASET = FEATURES_DIR = MANUAL_FILE = OUTPUT_FILE = MESH_FEATURES = EXPORT_STATUS = None
+
+
+def configure_paths(dataset):
+    """Point all the file globals at the given dataset root."""
+    global DATASET, FEATURES_DIR, MANUAL_FILE, OUTPUT_FILE, MESH_FEATURES, EXPORT_STATUS
+    DATASET       = dataset.rstrip("/")
+    FEATURES_DIR  = f"{DATASET}/feature_tables"
+    MANUAL_FILE   = f"{FEATURES_DIR}/manual_discards.txt"
+    OUTPUT_FILE   = f"{FEATURES_DIR}/labels_to_discard.csv"
+    MESH_FEATURES = f"{FEATURES_DIR}/mesh_features.csv"
+    EXPORT_STATUS = f"{DATASET}/export_status.csv"
+
+
+configure_paths(DEFAULT_DATASET)
 
 
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
 
+def _strip(uid):
+    uid = uid.strip()
+    return uid[:-len("_mesh.obj")] if uid.endswith("_mesh.obj") else uid
+
+
+def universe():
+    """label_uids that were actually exported (the only meshes that can be
+    processed). From export_status.csv; falls back to mesh_features.csv."""
+    if os.path.exists(EXPORT_STATUS):
+        with open(EXPORT_STATUS) as f:
+            return {r["label_uid"].strip() for r in csv.DictReader(f) if r.get("label_uid")}
+    print(f"  [warn] {EXPORT_STATUS} not found — using all mesh_features ids as the universe")
+    with open(MESH_FEATURES) as f:
+        return {r["label_uid"].strip() for r in csv.DictReader(f) if r.get("label_uid")}
+
+
 def load_manual():
-    path = os.path.join(FOLDER, MANUAL_FILE)
-    if not os.path.exists(path):
-        print(f"No manual discard file found at {path}. Starting with empty manual list.")
+    if not os.path.exists(MANUAL_FILE):
+        print(f"No manual discard file at {MANUAL_FILE}. Starting empty.")
         return set()
-    with open(path) as f:
-        return {l.strip() for l in f if l.strip()}
+    with open(MANUAL_FILE) as f:
+        return {_strip(l) for l in f if l.strip()}
 
 
 def save_manual(ids):
-    with open(os.path.join(FOLDER, MANUAL_FILE), "w") as f:
+    with open(MANUAL_FILE, "w") as f:
         for uid in sorted(ids):
             f.write(uid + "\n")
 
 
 def load_auto(sphericity_tol):
-    """Derive discards from feature CSVs.
-
-    Returns a dict with keys 'sphericity' and 'intensity', each a set of ids.
-    The combined auto set is the union of both.
-    """
-    import pandas as pd
+    """Derive discards from mesh_features.csv. Returns {'sphericity': set}."""
     by_sphericity = set()
-    by_intensity  = set()
-
-    mesh_path = os.path.join(FEATURES_PATH, "mesh_features.csv")
-    if os.path.exists(mesh_path):
-        mesh = pd.read_csv(mesh_path)
-        bad = mesh.loc[mesh["sphericity"] > sphericity_tol, "label_uid"]
-        by_sphericity.update(bad.astype(str))
-        print(f"  sphericity > {sphericity_tol}: {len(bad)} organoids")
+    if os.path.exists(MESH_FEATURES):
+        with open(MESH_FEATURES) as f:
+            for r in csv.DictReader(f):
+                uid = (r.get("label_uid") or "").strip()
+                sph = r.get("sphericity")
+                if uid and sph not in (None, "") and float(sph) > sphericity_tol:
+                    by_sphericity.add(uid)
+        print(f"  sphericity > {sphericity_tol}: {len(by_sphericity)} organoids")
     else:
-        print(f"  [skip] {mesh_path} not found")
+        print(f"  [skip] {MESH_FEATURES} not found")
+    return {"sphericity": by_sphericity}
 
-    disc_path = os.path.join(FEATURES_PATH, "organoids_to_discard.csv")
-    if os.path.exists(disc_path):
-        disc = pd.read_csv(disc_path)
-        bad = disc.loc[disc["C01.min_intensity"] < 1, "label_uid"]
-        by_intensity.update(bad.astype(str))
-        print(f"  DAPI min-intensity == 0: {len(bad)} organoids")
-    else:
-        print(f"  [skip] {disc_path} not found")
 
-    return {"sphericity": by_sphericity, "intensity": by_intensity}
+def write_combined(ids):
+    with open(OUTPUT_FILE, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["label_uid"])
+        for uid in sorted(ids):
+            w.writerow([uid])
 
 
 def rebuild(sphericity_tol):
-    """Combine auto + manual → save combined_labels_to_discard.npy."""
+    """((auto − corrected-timepoints) ∪ manual) ∩ exported  →  labels_to_discard.csv."""
+    uni = universe()
+    corrected = set(CORRECTED_TIMEPOINTS)
     print("Auto-derived:")
-    auto_sets = load_auto(sphericity_tol)
-    auto   = auto_sets["sphericity"] | auto_sets["intensity"]
+    auto = load_auto(sphericity_tol)["sphericity"]
     manual = load_manual()
-    combined = sorted(auto | manual)
-    out = os.path.join(FOLDER, COMBINED_FILE) 
-    np.save(out, np.array(combined, dtype=str))
+
+    # Auto discards are suppressed for corrected timepoints; manual discards are not.
+    auto_filtered = {i for i in auto if i.split("_")[0] not in corrected}
+    present = (auto_filtered | manual) & uni
+    combined = present
+    dropped = (auto | manual) - uni
+    auto_suppressed = auto - auto_filtered
+    write_combined(combined)
+
     print(f"  manual: {len(manual)} organoids")
-    print(f"Combined ({len(combined)} total) → {out}")
+    if auto_suppressed:
+        print(f"  [note] {len(auto_suppressed)} auto-discard ids are in corrected timepoints "
+              f"{CORRECTED_TIMEPOINTS} and were kept (manual discards in those timepoints still apply)")
+    if dropped:
+        print(f"  [note] {len(dropped)} discard ids are not in the export and were "
+              f"dropped (e.g. {sorted(dropped)[:3]})")
+    print(f"Combined ({len(combined)} of {len(uni)} exported) → {OUTPUT_FILE}")
     return combined
 
 
@@ -150,42 +190,40 @@ def cmd_update(sphericity_tol):
 
 
 def cmd_list(sphericity_tol):
-    auto_sets  = load_auto(sphericity_tol)
-    by_sph     = auto_sets["sphericity"]
-    by_int     = auto_sets["intensity"]
-    auto       = by_sph | by_int
-    manual     = load_manual()
-    all_ids    = sorted(auto | manual)
+    uni = universe()
+    corrected = set(CORRECTED_TIMEPOINTS)
+    by_sph = load_auto(sphericity_tol)["sphericity"]
+    manual = load_manual()
+    auto_filtered = {i for i in by_sph if i.split("_")[0] not in corrected}
+    all_ids = sorted((auto_filtered | manual) & uni)
 
-    print(f"\n{'ID':<35} {'SOURCE':<20} REASON")
-    print("-" * 70)
+    print(f"\n{'ID':<35} {'SOURCE':<16} REASON")
+    print("-" * 64)
     for uid in all_ids:
         reasons = []
         if uid in by_sph: reasons.append("sphericity")
-        if uid in by_int: reasons.append("intensity")
         if uid in manual: reasons.append("manual")
-        src = "auto + manual" if (uid in auto and uid in manual) else \
-              "auto"          if uid in auto else "manual"
-        print(f"{uid:<35} {src:<20} {', '.join(reasons)}")
-    print(f"\nauto: {len(auto)}  (sphericity: {len(by_sph)}, "
-          f"intensity: {len(by_int)}, both: {len(by_sph & by_int)})  "
-          f"manual: {len(manual)}  total unique: {len(all_ids)}")
+        src = "auto + manual" if (uid in by_sph and uid in manual) else \
+              "auto"          if uid in by_sph else "manual"
+        print(f"{uid:<35} {src:<16} {', '.join(reasons)}")
+    print(f"\nauto(sphericity): {len(by_sph & uni)}  manual: {len(manual & uni)}  "
+          f"total unique (exported): {len(all_ids)}")
 
 
 def cmd_add(sphericity_tol, new_ids):
+    new_ids = {_strip(i) for i in new_ids}
     manual = load_manual()
-    added = set(new_ids) - manual
-    manual |= set(new_ids)
-    save_manual(manual)
+    added = new_ids - manual
+    save_manual(manual | new_ids)
     print(f"Added {len(added)} to manual list.")
     rebuild(sphericity_tol)
 
 
 def cmd_remove(sphericity_tol, targets):
+    targets = {_strip(i) for i in targets}
     manual = load_manual()
-    missing = set(targets) - manual
-    manual -= set(targets)
-    save_manual(manual)
+    missing = targets - manual
+    save_manual(manual - targets)
     if missing:
         print(f"Not in manual list (ignored): {sorted(missing)}")
     print(f"Removed {len(targets) - len(missing)} from manual list.")
@@ -194,8 +232,7 @@ def cmd_remove(sphericity_tol, targets):
 
 def cmd_import(sphericity_tol, txt_path):
     with open(txt_path) as f:
-        lines = [l.strip() for l in f if l.strip()]
-    new_ids = [l.replace("_mesh.obj", "") for l in lines]
+        new_ids = [_strip(l) for l in f if l.strip()]
     print(f"Importing {len(new_ids)} ids from {txt_path}")
     cmd_add(sphericity_tol, new_ids)
 
@@ -214,8 +251,12 @@ if __name__ == "__main__":
                         help="ids (add/remove), or path (import)")
     parser.add_argument("--sphericity-tol", type=float, default=1.3,
                         help="Sphericity threshold for auto filter (default: 1.3)")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET,
+                        help=f"Dataset root holding feature_tables/ and export_status.csv "
+                             f"(default: {DEFAULT_DATASET}). E.g. Data/sup_dataset")
     args = parser.parse_args()
 
+    configure_paths(args.dataset)
     tol = args.sphericity_tol
 
     if args.cmd == "update":

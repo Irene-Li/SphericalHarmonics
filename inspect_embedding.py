@@ -14,7 +14,11 @@ The embedding is written by `src.utils.save_embedding` (e.g. from
 double_clustering.ipynb).
 
 The scatter can be colored by l_cross / area / time or by any fate marker's
-percentage (log scale, shared range, matching double_clustering.ipynb).
+percentage (the l=0 harmonic coefficient saved on the embedding as 'perc_<name>'
+point-fields by double_clustering.ipynb; log scale, shared range).
+
+Organoid ids are dataset-prefixed ('{dataset}_{timepoint}_{well}_{label}'); each
+mesh is loaded from '{data_root}/{dataset}' using that dataset's own config.json.
 
 Opens two separate windows (scatter + organoid); drag them apart so they
 don't overlap.
@@ -22,8 +26,7 @@ don't overlap.
 Run from the repository root, in the `scmpx` conda env:
 
     python inspect_embedding.py \
-        --embedding Data/20260224/embeddings/hks_emb.npz \
-        --data_path Data/20260224 --csv Data/cell_types_norm_neg.csv
+        --embedding Data/embeddings/hks_full_emb.npz --data_root Data
 
 Click a point in the scatter to load that organoid. Close either window to quit.
 """
@@ -46,6 +49,7 @@ from src.fatemarkers import FateMarkers
 
 ORG_NAME = "organoid"
 DEFAULT_MARKER = "lgr"
+COMBO_MARKERS = ("STEM", "EC", "PANETH")   # must all be present in perc_* fields
 
 
 def _fit_mesh(v, radius=1.0):
@@ -61,10 +65,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--embedding", required=True,
                     help="path to an embedding .npz (from utils.save_embedding)")
-    ap.add_argument("--data_path", default="Data/20260224",
-                    help="dataset root containing config.json + fractal_output/")
-    ap.add_argument("--csv", default="Data/cell_types_norm_neg.csv",
-                    help="cell-fate percentages CSV (indexed by label_uid)")
+    ap.add_argument("--data_root", default="Data",
+                    help="parent dir of the dataset folders. Organoid ids of the form "
+                         "'{dataset}_{timepoint}_{well}_{label}' are resolved to "
+                         "'{data_root}/{dataset}', each with its own config.json.")
     ap.add_argument("--vocab", default="sim/vocab_new.npz",
                     help="HKS bag-of-features vocab; adds per-vertex 'vocab-k' "
                          "overlays on the mesh (set to '' to disable)")
@@ -82,21 +86,63 @@ def main():
     shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
 
-    # ---- config + fate-name map ----------------------------------------
-    with open(f"{args.data_path}/config.json") as f:
-        cfg = json.load(f)
-    field_to_friendly = {fld: name for name, fld in cfg["annotation_names"].items()}
+    # ---- per-dataset config resolution ---------------------------------
+    # Ids are dataset-prefixed ('{dataset}_{bare_uid}').  Dataset names may
+    # contain underscores (e.g. 'main_dataset'), so we prefix-match against
+    # the actual folders present under data_root rather than splitting blindly.
+    known_datasets = sorted(
+        d for d in os.listdir(args.data_root)
+        if os.path.isfile(os.path.join(args.data_root, d, "config.json")))
+    print(f"Known datasets: {known_datasets}")
 
-    # ---- fate percentages CSV ------------------------------------------
-    import pandas as pd
-    df = pd.read_csv(args.csv).set_index("label_uid")
-    fate_cols = [c for c in df.columns if c.endswith(".cnt_exclusive")]
-    fate_labels = [c.split(".")[0] for c in fate_cols]
+    # short prefix per dataset: first letter of each '_'-separated word, e.g.
+    # 'main_dataset' -> 'md', 'sup_dataset' -> 'sd'
+    _ds_short = {"_".join(w): "".join(w[0] for w in ds.split("_"))
+                 for ds in known_datasets
+                 for w in [ds.split("_")]}
 
-    def percentages_for(uid):
-        if uid in df.index:
-            return np.nan_to_num(df.loc[uid, fate_cols].to_numpy(dtype=float))
-        return np.zeros(len(fate_cols))
+    def shorten_id(full_id):
+        """'main_dataset_day1p5_A01_42' -> 'md_1p5_a01_42'"""
+        for ds in known_datasets:
+            if full_id.startswith(ds + "_"):
+                bare = full_id[len(ds) + 1:]          # 'day1p5_A01_42'
+                parts = bare.split("_")
+                tp = parts[0].lstrip("day")            # '1p5'
+                rest = "_".join(parts[1:]).lower()     # 'a01_42'
+                return f"{_ds_short[ds]}_{tp}_{rest}"
+        return full_id
+
+    def split_uid(full):
+        """(data_path, bare_uid) for a dataset-prefixed id."""
+        for ds in known_datasets:
+            if full.startswith(ds + "_"):
+                return os.path.join(args.data_root, ds), full[len(ds) + 1:]
+        raise ValueError(f"Cannot determine dataset for id: {full!r}")
+
+    _cfg_cache = {}
+
+    def load_cfg(data_path):
+        """(cfg, field_to_friendly) for a dataset, cached."""
+        if data_path not in _cfg_cache:
+            with open(f"{data_path}/config.json") as fh:
+                cfg = json.load(fh)
+            f2f = {}
+            for name, flds in cfg["annotation_names"].items():
+                for fl in ([flds] if isinstance(flds, str) else flds):
+                    f2f[fl] = name
+            _cfg_cache[data_path] = (cfg, f2f)
+        return _cfg_cache[data_path]
+
+    # ---- fate percentages from the embedding ---------------------------
+    # double_clustering saves each fate as a 'perc_<name>' point-field: the
+    # lowest-order (l=0) harmonic coefficient / sqrt(area), i.e. the fraction of
+    # surface covered by that marker in [0, 1]. No cell-type CSV needed.
+    fate_labels = [k[len("perc_"):] for k in emb if k.startswith("perc_")]
+    perc_matrix = (np.column_stack([emb[f"perc_{lab}"].astype(float) for lab in fate_labels])
+                   if fate_labels else np.zeros((len(ids), 0)))
+    log_perc = np.log(perc_matrix + 1e-3)
+    log_lo, log_hi = ((float(log_perc.min()), float(log_perc.max()))
+                      if fate_labels else (0.0, 1.0))
 
     # ---- optional HKS bag-of-features vocabulary -----------------------
     # Adds per-vertex 'vocab-k' overlays on the mesh, computed exactly like
@@ -113,12 +159,6 @@ def main():
     elif args.vocab:
         print(f"No vocab at {args.vocab} -- skipping vocab overlays")
 
-    # per-organoid fate percentages aligned to the embedding ids.
-    # Colour on a log scale with a shared range across fates, as in the notebook.
-    perc_matrix = np.array([percentages_for(u) for u in ids])      # (N, n_fates)
-    log_perc = np.log(perc_matrix + 1e-3)
-    log_lo, log_hi = float(log_perc.min()), float(log_perc.max())
-
     # timepoints -> numeric code for coloring
     uniq_t = sorted(set(times))
     tcode = np.array([uniq_t.index(t) for t in times], dtype=float)
@@ -127,24 +167,27 @@ def main():
     color_fields = {"l_cross": (l_cross, "Greens", (1, 8)),
                     "area":    (areas,   "Blues",  None),
                     "time":    (tcode,   "viridis", None)}
+    color_options = ["l_cross", "area", "time"]
+    cat_levels = {}   # categorical field -> (code, label) pairs for the colorbar
+    cat_cmaps = {}    # categorical field -> explicit colour list (else tab10/tab20)
 
-    # lgr/sero/lyz presence-absence combo (8-way categorical label from the fate CSV)
-    def _frac(uid, name):
-        col = f"{name}.cnt_exclusive"
-        return float(df.loc[uid, col]) if (uid in df.index and col in df.columns) else 0.0
-    combo = np.array([f"lgr{'+' if _frac(u, 'LGR') > 0 else '-'} "
-                      f"sero{'+' if _frac(u, 'SERO') > 0 else '-'} "
-                      f"lyz{'+' if _frac(u, 'LYZ') > 0 else '-'}" for u in ids])
-    combo_levels = sorted(set(combo))
-    combo_codes = np.array([combo_levels.index(c) for c in combo], dtype=float)
-    color_fields["fate_combo"] = (combo_codes, "tab10", (0, max(1, len(combo_levels) - 1)))
-
-    # categorical fields -> (code, label) pairs to annotate the colorbar
-    cat_levels = {"fate_combo": list(enumerate(combo_levels))}
+    # 3-marker presence-absence combo (8-way categorical), from the perc fields
+    if all(m in fate_labels for m in COMBO_MARKERS):
+        a, b, c = COMBO_MARKERS
+        pj = {m: fate_labels.index(m) for m in COMBO_MARKERS}
+        combo = np.array([f"{a}{'+' if perc_matrix[i, pj[a]] > 0 else '-'} "
+                          f"{b}{'+' if perc_matrix[i, pj[b]] > 0 else '-'} "
+                          f"{c}{'+' if perc_matrix[i, pj[c]] > 0 else '-'}"
+                          for i in range(len(ids))])
+        combo_levels = sorted(set(combo))
+        combo_codes = np.array([combo_levels.index(c) for c in combo], dtype=float)
+        color_fields["fate_combo"] = (combo_codes, "tab10", (0, max(1, len(combo_levels) - 1)))
+        cat_levels["fate_combo"] = list(enumerate(combo_levels))
+        color_options.append("fate_combo")
 
     for j, lab in enumerate(fate_labels):
         color_fields[lab] = (log_perc[:, j], "Reds", (log_lo, log_hi))
-    color_options = ["l_cross", "area", "time", "fate_combo"] + list(fate_labels)
+    color_options += list(fate_labels)
     fate_set = set(fate_labels)
 
     # shape-cluster colouring (only present on the shape embedding)
@@ -154,6 +197,32 @@ def main():
         color_options.insert(3, "shape_cluster")
         uniq_cl = sorted(set(shape_clusters.astype(int)))
         cat_levels["shape_cluster"] = [(c, f"cluster {c}") for c in uniq_cl]
+
+    # uid_groups membership (categorical): point-field saved by double_clustering
+    # as 'uid_group' (0 = none, g+1 = membership in hand-picked group g).
+    if "uid_group" in emb:
+        grp_code = emb["uid_group"].astype(float)
+        if (grp_code > 0).any():
+            ng = int(grp_code.max())
+            color_fields["uid_group"] = (grp_code, "tab10", (0, ng))
+            cat_levels["uid_group"] = ([(0, "none")]
+                                       + [(g + 1, f"group {g + 1}") for g in range(ng)])
+            base = plt.get_cmap("tab10" if ng <= 9 else "tab20")
+            cat_cmaps["uid_group"] = ["lightgrey"] + [base(i % base.N) for i in range(ng)]
+            color_options.append("uid_group")
+            print(f"uid_group: {int((grp_code > 0).sum())} of {len(ids)} points labelled "
+                  f"({ng} groups)")
+
+    # trusted organoids (categorical): point-field 'trusted' (1 if the organoid
+    # is in any confident small-chamfer pair, i.e. it supervises the chamfer term).
+    if "trusted" in emb:
+        is_trusted = emb["trusted"].astype(float)
+        if is_trusted.any():
+            color_fields["trusted"] = (is_trusted, "tab10", (0, 1))
+            cat_levels["trusted"] = [(0, "untrusted"), (1, "trusted")]
+            cat_cmaps["trusted"] = ["lightgrey", "crimson"]
+            color_options.append("trusted")
+            print(f"trusted: {int(is_trusted.sum())} of {len(ids)} points")
 
     state = {"org": None}
 
@@ -167,20 +236,29 @@ def main():
     ps.set_navigation_style("turntable")
 
     def load_organoid(idx):
-        uid = ids[idx]
+        data_path, uid = split_uid(ids[idx])
+        cfg, field_to_friendly = load_cfg(data_path)
         if state["org"] is not None:
             state["org"].remove()
             state["org"] = None
 
-        vtp = utils.organoid_vtp_path(args.data_path, cfg, uid)
-        obj = utils.organoid_obj_path(args.data_path, cfg, uid)
+        flat = cfg.get("layout") == "vtp_flat"
+        if flat:
+            vtp    = utils.vtp_flat_path(data_path, cfg, uid)
+            obj    = utils.vtp_flat_obj_path(data_path, cfg, uid)
+            c_path = utils.vtp_flat_coeffs_path(data_path, cfg, uid)
+        else:
+            vtp    = utils.organoid_vtp_path(data_path, cfg, uid)
+            obj    = utils.organoid_obj_path(data_path, cfg, uid)
+            c_path = utils.organoid_coeffs_path(data_path, cfg, uid)
+
         fields, field_names = None, None
         try:
             m = FateMarkers()
             if os.path.exists(vtp):
                 m.load_mesh_from_file(vtp)
-                m._refine_lgr5_marker()  # match the rerun_fm / coeffs pipeline
-                m.align_with_pca()       # canonical PCA pose, matching the coeffs frame
+                m._refine_markers(cfg["annotation_names"], cfg["exclusion_rules"])
+                m.align_with_pca()
                 v, f, fields, field_names = m.v, m.f, m.fields, m.field_names
             elif os.path.exists(obj):
                 import igl
@@ -203,7 +281,7 @@ def main():
         # per-vertex HKS vocab encoding (uses the saved eigendecomposition)
         if vocab is not None:
             try:
-                cf = np.load(utils.organoid_coeffs_path(args.data_path, cfg, uid))
+                cf = np.load(c_path)
                 eigvecs = cf["eigvecs"]
                 if eigvecs.shape[0] != v.shape[0]:
                     raise ValueError(f"eigvec/vertex mismatch "
@@ -255,8 +333,11 @@ def main():
             # discrete colormap: one solid colour band per class (codes 0..n-1)
             codes, labels = zip(*cat_levels[field])
             n = len(codes)
-            base = plt.get_cmap("tab10" if n <= 10 else "tab20")
-            disc = ListedColormap([base(i % base.N) for i in range(n)])
+            if field in cat_cmaps:
+                disc = ListedColormap(cat_cmaps[field])
+            else:
+                base = plt.get_cmap("tab10" if n <= 10 else "tab20")
+                disc = ListedColormap([base(i % base.N) for i in range(n)])
             sc.set_cmap(disc)
             sc.set_norm(BoundaryNorm(np.arange(n + 1) - 0.5, n))
             cbar.update_normal(sc)
@@ -285,18 +366,18 @@ def main():
     ax_bar.set_yticklabels(fate_labels)
     ax_bar.invert_yaxis()
     ax_bar.set_xlim(0, 1)
-    ax_bar.set_xlabel("fraction of cells")
-    ax_bar.set_title("fate %")
+    ax_bar.set_xlabel("cell fraction")
+    ax_bar.set_title("fate")
 
     def select(idx):
         uid = ids[idx]
         hl.set_offsets([xy[idx]])
-        vals = percentages_for(uid)
+        vals = perc_matrix[idx] if len(fate_labels) else np.zeros(0)
         for b, v in zip(bars, vals):
             b.set_width(v)
-        ax_bar.set_xlim(0, max(0.05, float(np.max(vals))))
-        ax_bar.set_title(f"fate %  —  {uid}\n time {times[idx]} | L {l_cross[idx]:.2f}"
-                         f" | area {areas[idx]:.0f}")
+        ax_bar.set_xlim(0, max(0.05, float(np.max(vals)) if len(vals) else 0.05))
+        ax_bar.set_title(f"{shorten_id(uid)}\n"
+                         f"t={times[idx]} L={l_cross[idx]:.1f} a={areas[idx]:.0f}")
         fig.canvas.draw_idle()
         load_organoid(idx)
 

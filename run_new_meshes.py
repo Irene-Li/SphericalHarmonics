@@ -1,67 +1,132 @@
 from tqdm import tqdm
 from src.fatemarkers import FateMarkers
-import numpy as np 
-import os 
-import anndata as ad
-import pandas as pd
-from collections import defaultdict
-import json 
+import numpy as np
+import os
+import csv
+import glob
+import json
 import argparse
+import concurrent.futures
 
-def run_fatemarkers(mesh_path, save_path, sec_cell_names=None):
+
+def _init_worker(n_threads):
+    """Set BLAS/OpenMP thread count in each worker process to avoid oversubscription."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = str(n_threads)
+
+
+def run_fatemarkers(mesh_path, save_path, compute_fate=True,
+                    annotation_names=None, exclusion_rules=None):
     m = FateMarkers()
     m.load_mesh_from_file(mesh_path)
-    m._refine_lgr5_marker(sec_cell_names=sec_cell_names)
+    if compute_fate:
+        m._refine_markers(annotation_names, exclusion_rules)
     m.align_with_pca()
     m.precompute_eigens(lmax=15)
-    m.compute_coefficients()
-    m.save_results(save_path)
+    m.compute_coefficients(fate=compute_fate)
+    m.save_results(save_path, fate=compute_fate)
 
-def nested_dict():
-    return defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
-def convert_to_dict(strings): 
-    tree = nested_dict()
-    for s in strings:
-        parts = s.split('_')
-        day = parts[0]
-        well_letter = parts[1][0]
-        well_number = parts[1][1:]
-        number = int(parts[2])
-        
-        tree[day][well_letter][well_number].append(number)
-    return tree 
+def _run_one(args):
+    """Top-level wrapper for multiprocessing (must be picklable)."""
+    mesh_path, save_path, compute_fate, annotation_names, exclusion_rules = args
+    run_fatemarkers(mesh_path, save_path, compute_fate, annotation_names, exclusion_rules)
+    return mesh_path
 
-if __name__ == "__main__":
 
-    # parse arguments given the run script 
-    parser = argparse.ArgumentParser(description="Run FateMarkers on mesh data.")
-    parser.add_argument("folder_path", type=str, help="Path to the data folder (e.g. Data/20260224/)")
-    parser.add_argument("--discard_labels", type=str, default=None,
-                        help="Path to a .npy file of label names to discard (e.g. Data/20260224/combined_labels_to_discard.npy)")
-    parser.add_argument("--skip-existing", action="store_true",
-                        help="Skip a mesh if its _coeffs.npz and _transformed_mesh.obj already exist")
-    args = parser.parse_args()
+def _process_batch(tasks, workers, desc=""):
+    """Run a list of (mesh_path, save_path, compute_fate, ann, excl) tuples.
+    workers=1 → serial; workers>1 → ProcessPoolExecutor with 1 BLAS thread per worker."""
+    if workers == 1:
+        for t in tqdm(tasks, desc=desc):
+            try:
+                _run_one(t)
+            except Exception as e:
+                print(f"\nError processing {t[0]}: {e}")
+    else:
+        threads_per_worker = max(1, 8 // workers)
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_worker, initargs=(threads_per_worker,)) as ex:
+            futs = {ex.submit(_run_one, t): t for t in tasks}
+            for f in tqdm(concurrent.futures.as_completed(futs), total=len(futs), desc=desc):
+                try:
+                    f.result()
+                except Exception as e:
+                    print(f"\nError processing {futs[f][0]}: {e}")
 
-    folder_path = args.folder_path
-    if not folder_path.endswith('/'):
-        folder_path += '/'
 
-    with open(f"{folder_path}config.json", 'r') as f:
-        cfg = json.load(f)
+# ---------------------------------------------------------------------------
+# Layout 1: 'vtp_flat'  —  {folder}/{vtp_dir}/{timepoint}/{label_uid}.vtp
+# ---------------------------------------------------------------------------
 
+def discard_set(cfg):
+    """Set of label_uids to discard, read from the path in config['discard'].
+    manage_discards.py owns building that file. Returns empty set when no 'discard' block."""
+    d = cfg.get("discard")
+    if not d:
+        return set()
+    path = d.get("labels_to_discard_csv")
+    if not path or not os.path.exists(path):
+        print(f"  [warn] discard csv not found: {path}")
+        return set()
+    with open(path) as f:
+        return {r["label_uid"].strip() for r in csv.DictReader(f) if r.get("label_uid")}
+
+
+def run_vtp_flat(folder_path, cfg, skip_existing=True, workers=1):
+    """Process a 'vtp_flat' dataset: {folder}/{vtp_dir}/{timepoint}/{label_uid}.vtp.
+    Shape coefficients only (compute_fate=False)."""
+    discard = discard_set(cfg)
+    print(f"discard set: {len(discard)} organoids")
+    vtp_dir = cfg.get("vtp_dir", "vtp")
+
+    def label_of(p):
+        return os.path.splitext(os.path.basename(p))[0]
+
+    for timepoint in cfg["timepoints"]:
+        tp_dir = os.path.join(folder_path, vtp_dir, timepoint)
+        if not os.path.isdir(tp_dir):
+            print(f"  [skip] no vtp dir {tp_dir}")
+            continue
+        files = sorted(glob.glob(os.path.join(tp_dir, "*.vtp")))
+        kept = [f for f in files if label_of(f) not in discard]
+
+        save_dir = f'{tp_dir}/fm_data/'
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, f"good_labels_{timepoint}.npy"),
+                np.array([label_of(f) for f in kept]))
+
+        if skip_existing:
+            todo = [f for f in kept
+                    if not (os.path.exists(os.path.join(save_dir, f"{label_of(f)}_coeffs.npz")) and
+                            os.path.exists(os.path.join(save_dir, f"{label_of(f)}_transformed_mesh.obj")))]
+        else:
+            todo = kept
+        print(f"{timepoint}: {len(todo)}/{len(kept)} to process "
+              f"({len(files) - len(kept)} discarded)")
+
+        tasks = [(f, os.path.join(save_dir, label_of(f)), False, None, None) for f in todo]
+        _process_batch(tasks, workers, desc=timepoint)
+
+
+# ---------------------------------------------------------------------------
+# Layout 2: 'fractal_output'  —  the original per-well directory tree
+#   {folder}/fractal_output/{tp}/{zarr}/{w[0]}/{w[1:]}/{round}/meshes/{mesh_name}/{label}.vtp
+# ---------------------------------------------------------------------------
+
+def run_fractal_output(folder_path, cfg, skip_existing=False, workers=1):
+    """Process an old 'fractal_output' dataset. Computes fate coefficients."""
     timepoints = cfg['timepoints']
     zarr_names = cfg['zarr_names']
     wells = cfg['wells']
-    mesh_name = cfg['mesh_name']    
+    mesh_name = cfg['mesh_name']
     rounds = cfg['rounds']
-    sec_cell_names = cfg['sec_cell_names']
+    annotation_names = cfg['annotation_names']
+    exclusion_rules = cfg['exclusion_rules']
 
-    # load the discard labels if provided
-    discard_tree = None
-    if args.discard_labels is not None:
-        discard_labels = np.load(args.discard_labels)
-        discard_tree = convert_to_dict(discard_labels)
+    discard = discard_set(cfg)
+    print(f"discard set: {len(discard)} organoids")
 
     for timepoint in timepoints:
         zarr_name = zarr_names[timepoint]
@@ -71,11 +136,8 @@ if __name__ == "__main__":
             mesh_path = f"{path}meshes/{mesh_name}/"
             all_labels = [int(l.split('.')[0]) for l in os.listdir(mesh_path)]
 
-            if discard_tree is not None:
-                to_discard = discard_tree[timepoint][well_name[0]][well_name[1:]]
-                good_labels = [l for l in all_labels if l not in to_discard]
-            else:
-                good_labels = all_labels
+            good_labels = [l for l in all_labels
+                           if f"{timepoint}_{well_name}_{l}" not in discard]
 
             fm_data = f"{path}fm_data/"
             if not os.path.exists(fm_data):
@@ -83,7 +145,7 @@ if __name__ == "__main__":
 
             np.save(f"{fm_data}good_labels.npy", np.array(good_labels))
 
-            if args.skip_existing:
+            if skip_existing:
                 todo = [l for l in good_labels
                         if not (os.path.exists(f"{fm_data}{l}_coeffs.npz") and
                                 os.path.exists(f"{fm_data}{l}_transformed_mesh.obj"))]
@@ -93,17 +155,31 @@ if __name__ == "__main__":
             if not todo:
                 continue
 
-            for label in tqdm(todo):
-                mesh_file = f"{mesh_path}{label}.vtp"
-                if not os.path.exists(mesh_file):
-                    print(f"Mesh file does not exist: {mesh_file}")
-                    continue
-                save_loc = f"{fm_data}{label}"
-                try:
-                    # rerun_fatemarkers(mesh_file, save_loc, sec_cell_names=sec_cell_names)
-                    run_fatemarkers(mesh_file, save_loc, sec_cell_names=sec_cell_names)
-                except Exception as e:
-                    print(f"Error processing mesh {mesh_file}: {e}")
-                    continue 
+            tasks = [(f"{mesh_path}{l}.vtp", f"{fm_data}{l}", True, annotation_names, exclusion_rules)
+                     for l in todo if os.path.exists(f"{mesh_path}{l}.vtp")]
+            _process_batch(tasks, workers, desc=f"{timepoint} {well_name}")
 
 
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Run FateMarkers on mesh data.")
+    parser.add_argument("folder_path", type=str, help="Path to the data folder (e.g. Data/20260224/)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel worker processes (default: 1 = serial). "
+                             "Each worker uses 1 BLAS thread to avoid oversubscription.")
+    parser.add_argument("--reprocess", action="store_true",
+                        help="Reprocess meshes even if _coeffs.npz and _transformed_mesh.obj already exist")
+    args = parser.parse_args()
+
+    folder_path = args.folder_path
+    if not folder_path.endswith('/'):
+        folder_path += '/'
+
+    with open(f"{folder_path}config.json", 'r') as f:
+        cfg = json.load(f)
+
+    # dispatch on the dataset layout
+    if cfg.get("layout") == "vtp_flat":
+        run_vtp_flat(folder_path, cfg, skip_existing=not args.reprocess, workers=args.workers)
+    else:
+        run_fractal_output(folder_path, cfg, skip_existing=not args.reprocess, workers=args.workers)

@@ -131,18 +131,49 @@ class FateMarkers():
             self.fields.append(np.array(array))
         self.fields = np.array(self.fields).T  # Transpose to match vertices
 
-    def _refine_lgr5_marker(self, sec_cell_names=None): 
-        # Refine the LGR5 marker by averaging with neighbors
-        lgr5_idx = self.field_names.index('0.C02.percentile99_class')
+    def _refine_markers(self, annotation_names, exclusion_rules):
+        """Combine multi-channel markers and apply biological mutual exclusion to
+        the per-vertex fields, in place. Mirrors the CSV's *.cnt_exclusive
+        definition so the displayed/encoded fates match the CSV.
 
-        if sec_cell_names is None:
-            sec_cell_names = ['3.C03.percentile99_class', '1.C03.percentile99_class', 
-                              '2.C04.percentile99_class', '3.C02.percentile99_class', 
-                          '2.C02.percentile99_class', '0.C03.percentile99_class',]
-        secretory_cell_indices = [self.field_names.index(name) for name in sec_cell_names]
+        Args:
+            annotation_names: friendly-name -> vtp field-name, or a list of
+                field-names (duplicate channels are combined elementwise via max,
+                e.g. 'ta' = cycd OR cyca). A combined marker is appended as a new
+                per-vertex field named by the marker key (e.g. 'ta').
+            exclusion_rules:  friendly-name -> list of markers whose presence at a
+                vertex zeroes this marker there.
 
-        filter = np.any(self.fields[:, secretory_cell_indices] > 0, axis=1)
-        self.fields[:, lgr5_idx][filter] = 0
+        Returns:
+            self: For method chaining
+        """
+        # resolve each friendly marker to a single working column
+        idx = {}
+        for fr, flds in annotation_names.items():
+            flds = [flds] if isinstance(flds, str) else list(flds)
+            cols = [self.field_names.index(f) for f in flds if f in self.field_names]
+            if not cols:
+                continue
+            if len(cols) == 1:
+                idx[fr] = cols[0]
+            else:  # combine duplicate channels into a new field named by the marker
+                combined = self.fields[:, cols].max(axis=1)
+                self.fields = np.column_stack([self.fields, combined])
+                self.field_names = list(self.field_names) + [fr]
+                idx[fr] = self.fields.shape[1] - 1
+
+        # presence snapshot before any modification -> order-independent exclusion
+        present = {fr: self.fields[:, i] > 0 for fr, i in idx.items()}
+        orig = self.fields.copy()
+        for marker, excluders in exclusion_rules.items():
+            if marker not in idx:
+                continue
+            keep = present[marker].copy()
+            for ex in excluders:
+                if ex in present:
+                    keep &= ~present[ex]
+            self.fields[:, idx[marker]] = np.where(keep, orig[:, idx[marker]], 0)
+        return self
 
 
     def _eig_decomp(self, v, f, k=100, sigma=0): 
@@ -160,10 +191,12 @@ class FateMarkers():
         eigvals, eigvecs = sp.linalg.eigsh(L, k=k, M=mass_matrix, sigma=sigma, which='LM')
         return eigvals, eigvecs, mass_matrix
 
-    def compute_coefficients(self):
+    def compute_coefficients(self, fate=True):
         self.coeffs_v = self.modes.T @ (self.mass_matrix @ self.v)
+        if not fate:
+            return self.coeffs_v
         self.coeffs_fm = self.modes.T @ (self.mass_matrix @ self.fields)
-        return self.coeffs_v, self.coeffs_fm 
+        return self.coeffs_v, self.coeffs_fm
 
     def compute_hks_for_new_times(self, new_ts=[1, 5, 10], coeffs=True):
         hks = [] 
@@ -208,34 +241,37 @@ class FateMarkers():
         diff = self.v - v_recon 
         return np.sqrt(np.sum(diff**2)/self.v.shape[0])/np.sqrt(self.area)
 
-    def save_results(self, path):
+    def save_results(self, path, fate=True):
         filename = f"{path}_coeffs.npz"
 
         save_dict = {
-            'coeffs_v': self.coeffs_v, 
+            'coeffs_v': self.coeffs_v,
             'eigvals': self.eigvals,
             'eigvecs': self.eigvecs,
-            'modes': self.modes, 
+            'modes': self.modes,
             'mass_matrix': self.mass_matrix,
             'transform_matrix': self.transform_matrix,
-            'coeffs_fm': self.coeffs_fm,
-            'field_names': self.field_names,
-            'lmax': self.lmax, 
-            'area': self.area 
+            'lmax': self.lmax,
+            'area': self.area
         }
+        if fate:
+            save_dict['coeffs_fm'] = self.coeffs_fm
+            save_dict['field_names'] = self.field_names
         np.savez(filename, **save_dict)
-        
+
         igl.write_triangle_mesh(path + '_transformed_mesh.obj', self.v, self.f)
 
-    def load_results(self, path): 
+    def load_results(self, path):
         data = np.load(path + '_coeffs.npz', allow_pickle=True)
         self.coeffs_v = data['coeffs_v']
-        self.coeffs_fm = data['coeffs_fm']
+        # fate coefficients are optional (shape-only runs skip them)
+        if 'coeffs_fm' in data.files:
+            self.coeffs_fm = data['coeffs_fm']
+            self.field_names = data['field_names'].tolist()
         self.eigvals = data['eigvals']
         self.eigvecs = data['eigvecs']
         self.modes = data['modes']
-        self.mass_matrix = data['mass_matrix'].item() 
-        self.field_names = data['field_names'].tolist()
+        self.mass_matrix = data['mass_matrix'].item()
         self.lmax = int(data['lmax'])
         self.transform_matrix = data['transform_matrix']
 
