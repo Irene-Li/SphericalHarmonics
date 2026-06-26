@@ -1,0 +1,27 @@
+# Conda environment for running inspect_embedding.py — the interactive organoid
+# shape viewer. This lists ONLY the packages that viewer needs, not the full
+# analysis pipeline.
+#
+# Create and activate it with:
+#     conda env create -f environment.yml
+#     conda activate organoid-viewer
+#
+# Then run the viewer (see README.md):
+#     python inspect_embedding.py --embedding hks_emb.npz --data_root Data
+
+name: organoid-viewer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - plotly        # imported by src/utils.py at load time
+  - pyshtools     # imported by src/meshharm.py at load time
+  - vtk           # reads the .vtp mesh files
+  - igl           # libigl: mesh I/O + geometry (import name: igl)
+  - pip
+  - pip:
+      - polyscope  # the interactive 3D mesh window
