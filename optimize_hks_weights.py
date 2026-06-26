@@ -39,12 +39,7 @@ from scipy.stats import pearsonr, spearmanr
 
 from src import utils
 
-
-# Vocab channels (HKS bag-of-features "words") to delete from the metric — the
-# drop mask. Listed vocabs get zero weight everywhere and the remaining weights are
-# learned in their absence. Edit this list to customise, or override with
-# --drop_vocab on the command line.
-DROP_VOCAB = [4]
+weight_index = 1 
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +239,13 @@ def main():
     parser.add_argument("--out", default="Data/hks_weights_full.npz")
     parser.add_argument("--mode_cut", type=int, default=8,
                         help="keep only the first this-many HKS modes (drop fine surface detail)")
-    parser.add_argument("--drop_vocab", type=int, nargs="*", default=DROP_VOCAB,
+    parser.add_argument("--drop_vocab", type=int, nargs="*", default=[],
                         help="vocab indices to delete entirely (the drop mask), e.g. --drop_vocab 2 4; "
                              "deleted vocabs get zero weight and the rest adapt to their absence")
     parser.add_argument("--conf_thr", type=float, default=0.9,
                         help="keep organoid pairs with chamfer below this absolute threshold as "
                              "confident correlation supervision (see chamfer distribution plot)")
-    parser.add_argument("--beta_group", type=float, default=0.5,
+    parser.add_argument("--beta_group", type=float, default=0.35,
                         help="weight of the hand-picked-group compactness term")
     parser.add_argument("--cv_threshold", type=float, default=0.1,
                         help="zero out features whose weight coefficient-of-variation across "
@@ -271,7 +266,7 @@ def main():
     if drop_vocab:
         assert 0 <= min(drop_vocab) and max(drop_vocab) < n_vocab, \
             f"drop_vocab {drop_vocab} out of range [0, {n_vocab - 1}]"
-        power_spectrum[:, :, drop_vocab] = 0.0          # deleted vocabs contribute nothing to any distance
+        power_spectrum[:, weight_index:, drop_vocab] = 0.0          # deleted vocabs contribute nothing to any distance
 
     organoid_features = power_spectrum.reshape(len(organoid_ids), -1)    # (N, n_features)
     id_to_index = {uid: i for i, uid in enumerate(organoid_ids)}
@@ -323,7 +318,7 @@ def main():
 
     weights = np.where(stable_mask, weight_mean, 0.0)
     if drop_vocab:
-        weights[:, drop_vocab] = 0.0                        # deleted vocabs -> zero weight everywhere
+        weights[weight_index:, drop_vocab] = 0.0                        # deleted vocabs -> zero weight everywhere
     if np.linalg.norm(weights) == 0:
         raise SystemExit(f"all features pruned at cv_threshold={args.cv_threshold} — raise it")
     weights *= np.sqrt(n_features) / np.linalg.norm(weights)    # renormalise the kept weights
