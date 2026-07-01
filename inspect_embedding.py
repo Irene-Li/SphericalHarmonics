@@ -68,6 +68,7 @@ import sys
 
 import numpy as np
 import polyscope as ps
+import polyscope.imgui as psim
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.colors import BoundaryNorm, ListedColormap, Normalize
@@ -121,6 +122,8 @@ def main():
     areas = emb["areas"].astype(float) if "areas" in emb else np.full(len(ids), np.nan)
     # optional per-point shape-cluster labels (saved on the shape embedding)
     shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
+    # optional aggregated clusters (0 = low-complexity merged group, 1..n = high-complexity)
+    agg_clusters = emb["agg_cluster"].astype(float) if "agg_cluster" in emb else None
     # optional perturbation/genotype condition ('WT' or a pert drug token)
     conditions = emb["condition"].astype(str) if "condition" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
@@ -292,6 +295,19 @@ def main():
         uniq_cl = sorted(set(shape_clusters.astype(int)))
         cat_levels["shape_cluster"] = [(c, f"cluster {c}") for c in uniq_cl]
 
+    # aggregated-cluster colouring: label 0 is the low-complexity merged group
+    # (shown grey), 1..n are the high-complexity clusters (distinct colours).
+    if agg_clusters is not None:
+        uniq_ag = sorted(set(agg_clusters.astype(int)))
+        color_fields["agg_cluster"] = (agg_clusters, "tab20", (min(uniq_ag), max(uniq_ag)))
+        cat_levels["agg_cluster"] = [(c, "low-cplx" if c == 0 else f"cluster {c}")
+                                     for c in uniq_ag]
+        n_high = sum(c != 0 for c in uniq_ag)
+        base = plt.get_cmap("tab10" if n_high <= 10 else "tab20")
+        hi = [base(i % base.N) for i in range(n_high)]
+        cat_cmaps["agg_cluster"] = (["lightgrey"] + hi) if 0 in uniq_ag else hi
+        color_options.insert(4, "agg_cluster")
+
     # uid_groups membership (categorical): point-field saved by double_clustering
     # as 'uid_group' (0 = none, g+1 = membership in hand-picked group g).
     if "uid_group" in emb:
@@ -329,7 +345,69 @@ def main():
             color_options.append("condition")
             print(f"condition: {len(uniq_cond)} levels {uniq_cond}")
 
-    state = {"org": None}
+    # active_quantity persists the chosen colouring across organoid clicks;
+    # categories groups overlay names into Fate / HKS-shape; quant_values holds
+    # each overlay's per-vertex array so we can re-enable it by re-adding.
+    state = {"org": None, "active_quantity": DEFAULT_MARKER,
+             "categories": {}, "quant_values": {}}
+
+    def _set_active(name):
+        """Show the overlay `name` (and hide the previously shown one), then
+        remember it so the choice persists across organoids.
+
+        polyscope's add_scalar_quantity returns None (no handle to toggle), but
+        re-adding a quantity with an existing name replaces it in place — so we
+        re-add the target enabled and the previous one disabled. Only these two
+        are touched, regardless of how many overlays the organoid has."""
+        org, vals = state["org"], state["quant_values"]
+        if org is None or name not in vals:
+            return
+        prev = state["active_quantity"]
+        if prev and prev != name and prev in vals:
+            org.add_scalar_quantity(prev, vals[prev], cmap="viridis", enabled=False)
+        org.add_scalar_quantity(name, vals[name], cmap="viridis", enabled=True)
+        state["active_quantity"] = name
+
+    def _default_quantity(cats):
+        """Fallback colouring when the remembered overlay is absent here."""
+        if DEFAULT_MARKER in cats.get("Fate", []):
+            return DEFAULT_MARKER
+        hks_def = f"hks_t{HKS_DEFAULT_TIME}"
+        if hks_def in cats.get("HKS / shape", []):
+            return hks_def
+        for names in cats.values():
+            if names:
+                return names[0]
+        return None
+
+    ACCENT = (0.35, 0.85, 1.0, 1.0)   # cyan section headers, to stand out
+
+    def quantity_ui_callback():
+        """Standalone floating panel (separate from polyscope's structure UI):
+        overlays split into Fate vs HKS/shape categories, radio-selected (one
+        active at a time), persisted across organoids via _set_active."""
+        if not state["quant_values"]:
+            return
+        # own window, offset to the right of polyscope's top-left panel so it
+        # reads as a distinct control; draggable/resizable after first show.
+        psim.SetNextWindowPos((360.0, 20.0), psim.ImGuiCond_FirstUseEver)
+        psim.SetNextWindowSize((250.0, 430.0), psim.ImGuiCond_FirstUseEver)
+        psim.Begin("Colour organoid by")
+        chosen = None
+        for cat, names in state["categories"].items():
+            if not names:
+                continue
+            psim.PushStyleColor(psim.ImGuiCol_Text, ACCENT)
+            psim.SeparatorText(cat)
+            psim.PopStyleColor()
+            for nm in names:
+                # '##<cat>' keeps the visible label but gives each radio a unique
+                # ImGui ID (avoids conflicting-ID errors on duplicate names).
+                if psim.RadioButton(f"{nm}##{cat}", state["active_quantity"] == nm):
+                    chosen = nm
+        psim.End()
+        if chosen is not None:
+            _set_active(chosen)
 
     # ====================================================================
     # polyscope window: only the organoid mesh (independent rotation)
@@ -339,6 +417,11 @@ def main():
     ps.set_up_dir("y_up")
     ps.set_ground_plane_mode("none")
     ps.set_navigation_style("turntable")
+    # show only our custom 'Colour organoid by' window: drop polyscope's default
+    # panels (its Structures / Quantities selectors) and the auto wrapper window
+    # it would otherwise open around the user callback (we open our own Begin).
+    ps.set_build_default_gui_panels(False)
+    ps.set_open_imgui_window_for_user_callback(False)
 
     def _load_organoid_vtp(full_id):
         """Load mesh + fate fields straight from the .vtp (current default)."""
@@ -360,12 +443,18 @@ def main():
 
         org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(v), f, smooth_shade=True,
                                        color=(0.55, 0.65, 0.85))
+        # overlays added disabled; load_organoid enables the persisted choice.
+        cats = {"Fate": [], "HKS / shape": []}
+        vals = {}
         if fields is not None and len(field_names):
             for i, fld in enumerate(field_names):
                 friendly = field_to_friendly.get(fld, fld)
-                org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis",
-                                        enabled=(friendly == DEFAULT_MARKER))
-        return org
+                if friendly in vals:             # skip duplicate field names
+                    continue
+                org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis", enabled=False)
+                vals[friendly] = fields[:, i]
+                cats["Fate"].append(friendly)
+        return org, cats, vals
 
     def _load_organoid_pipeline(full_id):
         """Load the precomputed coeffs.npz + transformed_mesh.obj (--source pipeline).
@@ -420,27 +509,31 @@ def main():
 
         org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(m.v), m.f, smooth_shade=True,
                                        color=(0.55, 0.65, 0.85))
-        # Fate fields are added but NOT auto-enabled here: in pipeline mode the
-        # default visible quantity is always an HKS overlay (below) — that's the
-        # whole point of --source pipeline. Fields stay in polyscope's per-mesh
-        # "Quantities" list; click one there to switch the active colouring.
+        # All overlays are added disabled and grouped into Fate vs HKS/shape;
+        # load_organoid enables the persisted choice (default: an HKS overlay).
+        cats = {"Fate": [], "HKS / shape": []}
+        vals = {}
         if fields is not None and len(field_names):
             for i, fld in enumerate(field_names):
                 friendly = field_to_friendly.get(fld, fld)
+                if friendly in vals:             # skip duplicate field names
+                    continue
                 org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis", enabled=False)
+                vals[friendly] = fields[:, i]
+                cats["Fate"].append(friendly)
 
         # per-vertex HKS at a few diffusion times, straight from the saved
         # eigendecomposition (no recomputation needed). hks_t25 is shown by
         # default; the others are added alongside it for the quantities list.
         try:
             hks = m.compute_hks_for_new_times(HKS_TIMES, coeffs=False)
-            default_t = HKS_DEFAULT_TIME if HKS_DEFAULT_TIME in HKS_TIMES else HKS_TIMES[0]
             for k, t in enumerate(HKS_TIMES):
-                org.add_scalar_quantity(f"hks_t{t}", hks[:, k], cmap="viridis",
-                                        enabled=(t == default_t))
+                nm = f"hks_t{t}"
+                org.add_scalar_quantity(nm, hks[:, k], cmap="viridis", enabled=False)
+                vals[nm] = hks[:, k]
+                cats["HKS / shape"].append(nm)
             print(f"  HKS overlays added: {[f'hks_t{t}' for t in HKS_TIMES]} "
-                  f"(showing hks_t{default_t} — click another in the polyscope "
-                  f"Quantities panel to switch)")
+                  f"(pick one in the 'Colour organoid by' panel — HKS / shape section)")
         except Exception as e:
             print(f"  [warn] failed to compute HKS for {full_id}: {e}")
 
@@ -454,28 +547,41 @@ def main():
                 hks_scaled = v["scaler"].transform(hks_unit_area(m, ts))
                 encoding = encode_vocab(hks_scaled, v)        # (n_verts, n_words)
                 for k in range(encoding.shape[1]):
-                    org.add_scalar_quantity(f"bof_{v['name']}_word{k}", encoding[:, k],
-                                            cmap="viridis", enabled=False)
+                    nm = f"bof_{v['name']}_word{k}"
+                    org.add_scalar_quantity(nm, encoding[:, k], cmap="viridis", enabled=False)
+                    vals[nm] = encoding[:, k]
+                    cats["HKS / shape"].append(nm)
                 print(f"  bag-of-features added: bof_{v['name']}_word0..{encoding.shape[1] - 1}")
             except Exception as e:
                 print(f"  [warn] failed to compute '{v['name']}' bag-of-features "
                       f"for {full_id}: {e}")
 
-        return org
+        return org, cats, vals
 
     def load_organoid(idx):
         full_id = ids[idx]
         if state["org"] is not None:
             state["org"].remove()
             state["org"] = None
+        state["categories"], state["quant_values"] = {}, {}
 
         loader = _load_organoid_pipeline if args.source == "pipeline" else _load_organoid_vtp
-        org = loader(full_id)
-        if org is None:
+        result = loader(full_id)
+        if result is None:
             return
+        org, cats, vals = result
 
         org.reset_transform()
         state["org"] = org
+        state["categories"] = cats
+        state["quant_values"] = vals
+        # re-apply the remembered colouring so it persists across organoids;
+        # fall back to a sensible default if this organoid lacks that overlay.
+        allnames = [n for names in cats.values() for n in names]
+        active = state["active_quantity"] if state["active_quantity"] in allnames \
+            else _default_quantity(cats)
+        if active is not None:
+            _set_active(active)
         ps.reset_camera_to_home_view()
 
     # ====================================================================
@@ -569,6 +675,7 @@ def main():
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     # ---- run both event loops together ---------------------------------
+    ps.set_user_callback(quantity_ui_callback)
     plt.ion()
     plt.show(block=False)
     select(0)  # show something on startup
