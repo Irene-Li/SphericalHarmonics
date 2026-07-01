@@ -15,7 +15,7 @@ Scope (matches the weight-learning subset):
 Symmetric chamfer for two vertex point clouds A, B:
   cd(A, B) = mean_a min_b ||a - b||  +  mean_b min_a ||b - a||
 
-Output: Data/chamfer_highcomplexity.npz
+Output: Data/npz/chamfer_highcomplexity.npz
   ids  (n,)    organoid ids, row/col order of C
   C    (n, n)  symmetric chamfer matrix, zero diagonal
 
@@ -35,12 +35,12 @@ import igl
 from src import utils
 
 
-MASTER          = "Data/master.npz"
-OUT             = "Data/chamfer_norm.npz"
-L_CROSS_MIN     = 2.5
+MASTER          = "Data/npz/master.npz"
+OUT             = "Data/npz/chamfer_update.npz"
+L_CROSS_MIN     = 5.3   # lmax scale (degree); = old 6.3 on the pre-shift 1..9 scale
 DECIMATE_FACTOR = 10
 VTP_CFG         = {"vtp_dir": "vtp"}   # both datasets use layout 'vtp_flat', vtp_dir 'vtp'
-NORMALISE_MESHES  = True
+NORMALISE_MESHES  = False
 
 
 def obj_path(dataset, full_id):

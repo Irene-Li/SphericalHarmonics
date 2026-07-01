@@ -74,7 +74,7 @@ import os
 import csv
 import argparse
 
-DEFAULT_DATASET = "Data/main_dataset"
+DEFAULT_DATASET = "Data/sup_dataset"
 
 CORRECTED_TIMEPOINTS = ["day4p5", "day4p5-more"]
 

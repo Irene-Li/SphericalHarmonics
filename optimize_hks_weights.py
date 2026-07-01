@@ -234,9 +234,9 @@ def adam_fit(corr_sq_diffs, chamfer_values, group_sq_diffs, feature_variance, be
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--master", default="Data/master.npz")
-    parser.add_argument("--chamfer", default="Data/chamfer_highcomplexity.npz")
-    parser.add_argument("--out", default="Data/hks_weights_full.npz")
+    parser.add_argument("--master", default="Data/npz/master.npz")
+    parser.add_argument("--chamfer", default="Data/npz/chamfer_update.npz")
+    parser.add_argument("--out", default="Data/npz/hks_weights_full.npz")
     parser.add_argument("--mode_cut", type=int, default=8,
                         help="keep only the first this-many HKS modes (drop fine surface detail)")
     parser.add_argument("--drop_vocab", type=int, nargs="*", default=[],
@@ -245,7 +245,7 @@ def main():
     parser.add_argument("--conf_thr", type=float, default=0.9,
                         help="keep organoid pairs with chamfer below this absolute threshold as "
                              "confident correlation supervision (see chamfer distribution plot)")
-    parser.add_argument("--beta_group", type=float, default=0.35,
+    parser.add_argument("--beta_group", type=float, default=0.15,
                         help="weight of the hand-picked-group compactness term")
     parser.add_argument("--cv_threshold", type=float, default=0.1,
                         help="zero out features whose weight coefficient-of-variation across "

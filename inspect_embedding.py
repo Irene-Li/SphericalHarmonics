@@ -13,20 +13,37 @@ Two linked windows:
 The embedding is written by `src.utils.save_embedding` (e.g. from
 double_clustering.ipynb).
 
-The scatter can be colored by l_cross / area / time or by any fate marker's
-percentage (the l=0 harmonic coefficient saved on the embedding as 'perc_<name>'
-point-fields by double_clustering.ipynb; log scale, shared range).
+The scatter can be colored by l_cross / area / time / condition or by any fate
+marker's percentage (the l=0 harmonic coefficient saved on the embedding as 'perc_<name>'
+point-fields by double_clustering.ipynb; log scale, shared range), or by
+cell-type diversity (Hill numbers saved by dim_red.ipynb as 'hill_q<val>' point
+fields, one per order q in [0, 1]; magma, each q with its own colour range).
 
-Self-contained: this viewer needs only the embedding .npz and the original .vtp
-meshes — no pipeline outputs (no per-organoid coeffs/eigendecomposition, no
-transformed .obj). Point --data_root at any folder containing the .vtp files;
-they are found by filename regardless of how they're nested, so you can just
-drop the original meshes there. Each .vtp already carries the per-vertex fate
-fields, which are shown on the mesh.
+Mesh source is selectable with --source:
+  vtp       (default) load straight from the original .vtp — needs only the
+            embedding .npz and the .vtp meshes, no pipeline outputs.
+  pipeline  load the precomputed per-organoid '{stem}_coeffs.npz' (PCA-aligned
+            eigendecomposition) + '{stem}_transformed_mesh.obj' written by
+            run_new_meshes.py. This skips re-aligning/re-eigendecomposing the
+            mesh, and unlocks two HKS-based overlay families computed straight
+            from the saved eigenvalues/eigenvectors:
+              - raw HKS at fixed times ('hks_t1'/'hks_t4'/'hks_t25'/'hks_t100',
+                same times as elsewhere in the pipeline; hks_t25 shown by default)
+              - bag-of-features ('bof_<vocab>_word<k>'): per-vertex soft
+                assignment to each vocabulary in compute_master_npz.VOCABS
+                (kmeans_variable, pca_variable — same vocabs/encoding as the
+                'hks_bof_coeffs__*' columns in master.npz), loaded from sim/.
+            Fate fields come from the saved fate coefficients when the npz has
+            them (fractal_output runs with compute_fate=True); otherwise
+            they're read from a matching .vtp if one is found
+            (main_dataset/sup_dataset/pert, which only save shape coefficients).
+
+In both modes, --data_root is walked once and meshes/pipeline files are found
+by filename regardless of nesting, so any layout works.
 
 Organoid ids are dataset-prefixed ('{dataset}_{timepoint}_{well}_{label}'); the
-trailing '{timepoint}_{well}_{label}' is the .vtp filename stem used to find the
-mesh. If a dataset's config.json is present next to the meshes it is used (and
+trailing part is the filename stem used to find the mesh / pipeline files. If a
+dataset's config.json is present next to the meshes it is used (and
 auto-discovered) to give the fate fields friendly names; otherwise the raw vtp
 field names are shown.
 
@@ -37,6 +54,9 @@ Run from the repository root, in the `scmpx` conda env:
 
     python inspect_embedding.py \
         --embedding Data/embeddings/hks_emb.npz --data_root Data
+
+    python inspect_embedding.py \
+        --embedding Data/embeddings/hks_emb.npz --data_root Data --source pipeline
 
 Click a point in the scatter to load that organoid. Close either window to quit.
 """
@@ -56,10 +76,14 @@ from matplotlib.widgets import RadioButtons
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src import utils
 from src.fatemarkers import FateMarkers
+from compute_master_npz import find_times, hks_unit_area, encode_vocab, load_vocabs
 
 ORG_NAME = "organoid"
 DEFAULT_MARKER = "lgr"
 COMBO_MARKERS = ("STEM", "EC", "PANETH")   # must all be present in perc_* fields
+HKS_TIMES = [1, 4, 25, 100]   # matches compute_master_npz.SPARSE_TS / sim/encodings_*.vtp
+HKS_DEFAULT_TIME = 25         # shown by default in --source pipeline (mid diffusion scale)
+COEFFS_SUFFIX = "_coeffs.npz"
 
 
 def _fit_mesh(v, radius=1.0):
@@ -78,7 +102,14 @@ def main():
     ap.add_argument("--data_root", default="Data",
                     help="folder to search (recursively) for the original .vtp "
                          "meshes. Meshes are found by filename, so any layout works.")
+    ap.add_argument("--source", choices=["vtp", "pipeline"], default="vtp",
+                    help="'vtp' (default) loads straight from the .vtp; 'pipeline' "
+                         "loads the precomputed '{stem}_coeffs.npz' + "
+                         "'{stem}_transformed_mesh.obj' instead, which also enables "
+                         "HKS scalar overlays (see module docstring).")
     args = ap.parse_args()
+    print(f"Mesh source: {args.source}"
+          + ("  (HKS overlays enabled)" if args.source == "pipeline" else ""))
 
     # ---- load embedding -------------------------------------------------
     emb = utils.load_embedding(args.embedding)
@@ -90,28 +121,40 @@ def main():
     areas = emb["areas"].astype(float) if "areas" in emb else np.full(len(ids), np.nan)
     # optional per-point shape-cluster labels (saved on the shape embedding)
     shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
+    # optional perturbation/genotype condition ('WT' or a pert drug token)
+    conditions = emb["condition"].astype(str) if "condition" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
 
-    # ---- locate the original .vtp meshes -------------------------------
-    # Build a {filename-stem: [paths]} index by walking data_root once.  The
-    # collaborator only needs to drop the original .vtp files somewhere under
-    # data_root; the exact nesting doesn't matter.  An embedding id is the
-    # dataset name followed by the mesh's filename stem
-    # ('main_dataset' + '_' + 'day2p5_A04_67'), so a mesh is found by matching
-    # the longest trailing part of the id against an indexed stem.
+    # ---- locate the original .vtp meshes and/or the pipeline outputs ---
+    # Build {filename-stem: [paths]} indexes by walking data_root once. The
+    # collaborator only needs to drop the meshes (and/or pipeline fm_data/
+    # output) somewhere under data_root; the exact nesting doesn't matter. An
+    # embedding id is the dataset name followed by the mesh's filename stem
+    # ('main_dataset' + '_' + 'day2p5_A04_67'), and run_new_meshes.py writes
+    # pipeline outputs under the same stem ('{stem}_coeffs.npz' /
+    # '{stem}_transformed_mesh.obj'), so both are found by matching the
+    # longest trailing part of the id against an indexed stem.
     vtp_index = {}
+    pipeline_index = {}   # stem -> [base path, i.e. path without '_coeffs.npz']
     for root, _dirs, files in os.walk(args.data_root):
         for fn in files:
             if fn.endswith(".vtp"):
                 vtp_index.setdefault(fn[:-4], []).append(os.path.join(root, fn))
+            elif fn.endswith(COEFFS_SUFFIX):
+                stem = fn[:-len(COEFFS_SUFFIX)]
+                pipeline_index.setdefault(stem, []).append(os.path.join(root, stem))
     n_vtp = sum(len(v) for v in vtp_index.values())
-    print(f"Indexed {n_vtp} .vtp files under {args.data_root}")
-    if n_vtp == 0:
+    n_pipeline = sum(len(v) for v in pipeline_index.values())
+    print(f"Indexed {n_vtp} .vtp files and {n_pipeline} pipeline coeffs under {args.data_root}")
+    if n_vtp == 0 and args.source == "vtp":
         print(f"  [warn] no .vtp meshes found under {args.data_root!r} — "
               f"meshes won't load. Pass --data_root <folder with the .vtp files>.")
+    if n_pipeline == 0 and args.source == "pipeline":
+        print(f"  [warn] no '*{COEFFS_SUFFIX}' files found under {args.data_root!r} — "
+              f"meshes won't load. Run run_new_meshes.py first, or use --source vtp.")
 
-    def resolve_vtp(full_id):
-        """Map an embedding id to a .vtp path (or None if not found).
+    def _resolve_by_stem(full_id, index):
+        """Map an embedding id to a path via `index` (or None if not found).
 
         Tries progressively shorter trailing parts of the id ('a_b_c_d' ->
         'b_c_d' -> 'c_d' ...) and returns the first that is an indexed stem;
@@ -121,7 +164,7 @@ def main():
         toks = full_id.split("_")
         for i in range(len(toks)):
             stem = "_".join(toks[i:])
-            cands = vtp_index.get(stem)
+            cands = index.get(stem)
             if not cands:
                 continue
             if len(cands) == 1:
@@ -132,6 +175,19 @@ def main():
                     return p
             return cands[0]
         return None
+
+    def resolve_vtp(full_id):
+        return _resolve_by_stem(full_id, vtp_index)
+
+    def resolve_pipeline_base(full_id):
+        return _resolve_by_stem(full_id, pipeline_index)
+
+    # ---- bag-of-features vocabularies (--source pipeline only) ---------
+    # Same vocabs/encoding compute_master_npz uses for the 'hks_bof_coeffs__*'
+    # columns in master.npz (VOCABS: kmeans_variable, pca_variable), loaded once
+    # here and reused for every organoid as per-vertex 'bof_<vocab>_word<k>'
+    # overlays (soft-assignment encoding, not the spherical-harmonic coeffs).
+    bof_vocabs = load_vocabs() if args.source == "pipeline" else []
 
     def shorten_id(full_id):
         """'main_dataset_day1p5_A01_42' -> 'md_1p5_a01_42' (cosmetic title)."""
@@ -150,9 +206,9 @@ def main():
     _cfg_cache = {}
     _root_abs = os.path.abspath(args.data_root)
 
-    def find_cfg(vtp_path):
-        """(cfg_or_None, field_to_friendly) by searching up from a mesh path."""
-        d = os.path.dirname(os.path.abspath(vtp_path))
+    def find_cfg(mesh_path):
+        """(cfg_or_None, field_to_friendly) by searching up from a mesh/pipeline path."""
+        d = os.path.dirname(os.path.abspath(mesh_path))
         if d in _cfg_cache:
             return _cfg_cache[d]
         cur, result = d, (None, {})
@@ -189,7 +245,7 @@ def main():
     tcode = np.array([uniq_t.index(t) for t in times], dtype=float)
 
     # coloring options for the scatter: (values, cmap, clim) -- cmaps match the notebook
-    color_fields = {"l_cross": (l_cross, "Greens", (1, 8)),
+    color_fields = {"l_cross": (l_cross, "Greens", (0, 7)),
                     "area":    (areas,   "Blues",  None),
                     "time":    (tcode,   "viridis", None)}
     color_options = ["l_cross", "area", "time"]
@@ -214,6 +270,19 @@ def main():
         color_fields[lab] = (log_perc[:, j], "Reds", (log_lo, log_hi))
     color_options += list(fate_labels)
     fate_set = set(fate_labels)
+
+    # Hill-number diversity (saved by dim_red as 'hill_q<val>'): effective number
+    # of cell types per organoid at order q. Continuous, magma like the notebook;
+    # each q gets its own colour range (clim=None -> per-field min/max).
+    hill_labels = sorted((k for k in emb if k.startswith("hill_q")),
+                         key=lambda k: float(k[len("hill_q"):]))
+    hill_div = emb[hill_labels[-1]].astype(float) if hill_labels else None
+    if hill_labels:
+        for k in hill_labels:
+            color_fields[k] = (emb[k].astype(float), "magma", None)
+        color_options += hill_labels
+        print(f"hill diversity: {len(hill_labels)} orders q "
+              f"({hill_labels[0]}..{hill_labels[-1]})")
 
     # shape-cluster colouring (only present on the shape embedding)
     if shape_clusters is not None:
@@ -249,6 +318,17 @@ def main():
             color_options.append("trusted")
             print(f"trusted: {int(is_trusted.sum())} of {len(ids)} points")
 
+    # perturbation/genotype condition (categorical): point-field 'condition'
+    # saved by dim_red ('WT' for the wild-type datasets, the drug token for pert).
+    if conditions is not None:
+        uniq_cond = sorted(set(conditions))
+        if len(uniq_cond) > 1:
+            cond_code = np.array([uniq_cond.index(c) for c in conditions], dtype=float)
+            color_fields["condition"] = (cond_code, "tab10", (0, len(uniq_cond) - 1))
+            cat_levels["condition"] = list(enumerate(uniq_cond))
+            color_options.append("condition")
+            print(f"condition: {len(uniq_cond)} levels {uniq_cond}")
+
     state = {"org": None}
 
     # ====================================================================
@@ -260,16 +340,12 @@ def main():
     ps.set_ground_plane_mode("none")
     ps.set_navigation_style("turntable")
 
-    def load_organoid(idx):
-        full_id = ids[idx]
-        if state["org"] is not None:
-            state["org"].remove()
-            state["org"] = None
-
+    def _load_organoid_vtp(full_id):
+        """Load mesh + fate fields straight from the .vtp (current default)."""
         vtp = resolve_vtp(full_id)
         if vtp is None:
             print(f"  [warn] no .vtp found for {full_id} under {args.data_root}")
-            return
+            return None
         try:
             m = FateMarkers()
             m.load_mesh_from_file(vtp)
@@ -280,7 +356,7 @@ def main():
             v, f, fields, field_names = m.v, m.f, m.fields, m.field_names
         except Exception as e:
             print(f"  [warn] failed to load {full_id} from {vtp}: {e}")
-            return
+            return None
 
         org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(v), f, smooth_shade=True,
                                        color=(0.55, 0.65, 0.85))
@@ -289,6 +365,114 @@ def main():
                 friendly = field_to_friendly.get(fld, fld)
                 org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis",
                                         enabled=(friendly == DEFAULT_MARKER))
+        return org
+
+    def _load_organoid_pipeline(full_id):
+        """Load the precomputed coeffs.npz + transformed_mesh.obj (--source pipeline).
+
+        Geometry, eigenvalues/eigenvectors, and (when saved) the fate-field
+        coefficients all come from the npz/obj — no re-alignment or
+        re-eigendecomposition. The saved eigendecomposition also unlocks HKS
+        scalar overlays. Datasets whose pipeline run only computed shape
+        coefficients (no coeffs_fm) fall back to a matching .vtp for raw fate
+        fields; if none is found the mesh still loads with HKS overlays only.
+        """
+        base = resolve_pipeline_base(full_id)
+        if base is None:
+            print(f"  [warn] no pipeline '*{COEFFS_SUFFIX}' found for {full_id} "
+                  f"under {args.data_root}")
+            return None
+        try:
+            m = FateMarkers()
+            m.load_results(base)
+        except Exception as e:
+            print(f"  [warn] failed to load pipeline files for {full_id} from {base}: {e}")
+            return None
+
+        cfg, field_to_friendly = find_cfg(base)
+
+        # fate fields: prefer the saved fate coefficients (inverse spherical-harmonic
+        # reconstruction back to per-vertex values); fall back to a matching .vtp's
+        # raw fields when the npz only has shape coefficients (vtp_flat runs never
+        # compute fate, see run_new_meshes.run_vtp_flat).
+        fields, field_names = None, None
+        if getattr(m, "coeffs_fm", None) is not None:
+            try:
+                fields = m.reconstruct_from_coeffs(m.coeffs_fm, lmax=m.lmax)
+                field_names = m.field_names
+            except Exception as e:
+                print(f"  [warn] failed to reconstruct fate fields for {full_id}: {e}")
+        if fields is None:
+            vtp = resolve_vtp(full_id)
+            if vtp is not None:
+                try:
+                    mv = FateMarkers()
+                    mv.load_mesh_from_file(vtp)
+                    if cfg is not None and cfg.get("annotation_names"):
+                        mv._refine_markers(cfg["annotation_names"], cfg.get("exclusion_rules", {}))
+                    if mv.fields.shape[0] == m.v.shape[0]:
+                        fields, field_names = mv.fields, mv.field_names
+                    else:
+                        print(f"  [warn] vertex-count mismatch between pipeline mesh "
+                              f"and .vtp for {full_id} — skipping fate fields")
+                except Exception as e:
+                    print(f"  [warn] failed to read fate fields from .vtp for {full_id}: {e}")
+
+        org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(m.v), m.f, smooth_shade=True,
+                                       color=(0.55, 0.65, 0.85))
+        # Fate fields are added but NOT auto-enabled here: in pipeline mode the
+        # default visible quantity is always an HKS overlay (below) — that's the
+        # whole point of --source pipeline. Fields stay in polyscope's per-mesh
+        # "Quantities" list; click one there to switch the active colouring.
+        if fields is not None and len(field_names):
+            for i, fld in enumerate(field_names):
+                friendly = field_to_friendly.get(fld, fld)
+                org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis", enabled=False)
+
+        # per-vertex HKS at a few diffusion times, straight from the saved
+        # eigendecomposition (no recomputation needed). hks_t25 is shown by
+        # default; the others are added alongside it for the quantities list.
+        try:
+            hks = m.compute_hks_for_new_times(HKS_TIMES, coeffs=False)
+            default_t = HKS_DEFAULT_TIME if HKS_DEFAULT_TIME in HKS_TIMES else HKS_TIMES[0]
+            for k, t in enumerate(HKS_TIMES):
+                org.add_scalar_quantity(f"hks_t{t}", hks[:, k], cmap="viridis",
+                                        enabled=(t == default_t))
+            print(f"  HKS overlays added: {[f'hks_t{t}' for t in HKS_TIMES]} "
+                  f"(showing hks_t{default_t} — click another in the polyscope "
+                  f"Quantities panel to switch)")
+        except Exception as e:
+            print(f"  [warn] failed to compute HKS for {full_id}: {e}")
+
+        # bag-of-features: soft-assign per-vertex HKS (sampled at each vocab's own
+        # diffusion times) to that vocabulary's words. Same encoding as
+        # compute_master_npz.compute_bof_coeffs, but evaluated per-vertex instead
+        # of projected to spherical-harmonic coefficients.
+        for v in bof_vocabs:
+            try:
+                ts = find_times(m.area) if v["time"] == "variable" else np.asarray(v["ts"])
+                hks_scaled = v["scaler"].transform(hks_unit_area(m, ts))
+                encoding = encode_vocab(hks_scaled, v)        # (n_verts, n_words)
+                for k in range(encoding.shape[1]):
+                    org.add_scalar_quantity(f"bof_{v['name']}_word{k}", encoding[:, k],
+                                            cmap="viridis", enabled=False)
+                print(f"  bag-of-features added: bof_{v['name']}_word0..{encoding.shape[1] - 1}")
+            except Exception as e:
+                print(f"  [warn] failed to compute '{v['name']}' bag-of-features "
+                      f"for {full_id}: {e}")
+
+        return org
+
+    def load_organoid(idx):
+        full_id = ids[idx]
+        if state["org"] is not None:
+            state["org"].remove()
+            state["org"] = None
+
+        loader = _load_organoid_pipeline if args.source == "pipeline" else _load_organoid_vtp
+        org = loader(full_id)
+        if org is None:
+            return
 
         org.reset_transform()
         state["org"] = org
@@ -370,8 +554,10 @@ def main():
         for b, v in zip(bars, vals):
             b.set_width(v)
         ax_bar.set_xlim(0, max(0.05, float(np.max(vals)) if len(vals) else 0.05))
+        div_str = f" D={hill_div[idx]:.2f}" if hill_div is not None else ""
+        cond_str = f" c={conditions[idx]}" if conditions is not None else ""
         ax_bar.set_title(f"{shorten_id(uid)}\n"
-                         f"t={times[idx]} L={l_cross[idx]:.1f} a={areas[idx]:.0f}")
+                         f"t={times[idx]} L={l_cross[idx]:.1f} a={areas[idx]:.0f}{div_str}{cond_str}")
         fig.canvas.draw_idle()
         load_organoid(idx)
 

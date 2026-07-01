@@ -327,8 +327,12 @@ def group_pair_indices(uid_groups, id_to_row):
     return np.array(wi), np.array(wj), np.array(oi), np.array(oj)
 
 
-def _fate_from_csv(data_root, ids, datasets, csv_name):
-    """Slow path: compute per-organoid fate fractions from the per-cell CSVs."""
+def _fate_from_csv(data_root, datasets, csv_name):
+    """Slow path: build per-organoid fate fractions from the per-cell CSVs.
+
+    Iterates every row in the CSV and only stores organoids actually found
+    (no zero-fill for missing ids). Returns (found_ids, P, col_names).
+    """
     import pandas as pd
     perc_dfs = {}
     for ds in sorted(set(datasets)):
@@ -345,44 +349,58 @@ def _fate_from_csv(data_root, ids, datasets, csv_name):
         pos["label_uid"] = df["label_uid"].values
         perc_dfs[ds] = pos.groupby("label_uid")[excl].mean()
     if not perc_dfs:
-        return np.zeros((len(ids), 0)), []
+        return np.zeros(0, dtype=str), np.zeros((0, 0)), []
     ct_cols = sorted(set.intersection(*[set(df.columns) for df in perc_dfs.values()]))
     col_names = [c.split(".")[0] for c in ct_cols]
-    P = np.zeros((len(ids), len(col_names)))
-    for i, (full_id, ds) in enumerate(zip(ids, datasets)):
-        bare = full_id[len(ds) + 1:]
-        if ds in perc_dfs and bare in perc_dfs[ds].index:
-            P[i] = perc_dfs[ds].loc[bare, ct_cols].values
-    return P, col_names
+    found_ids, rows_P = [], []
+    for ds in sorted(set(datasets)):
+        if ds not in perc_dfs:
+            continue
+        for bare in perc_dfs[ds].index:
+            found_ids.append(f"{ds}_{bare}")
+            rows_P.append(perc_dfs[ds].loc[bare, ct_cols].values)
+    found_ids = np.array(found_ids, dtype=str)
+    P = np.array(rows_P, dtype=float) if rows_P else np.zeros((0, len(col_names)))
+    return found_ids, P, col_names
 
 
 def load_fate_percentages(data_root, ids, datasets,
                           csv_name="cell_features_class_with_projection_exclusive.csv",
-                          cache_path="Data/fate_percentages.npz", rebuild=False):
-    """Per-organoid fate-marker fractions aligned to `ids` -> (percentages (N,K), col_names).
+                          cache_path="Data/npz/fate_percentages.npz", update=False):
+    """Per-organoid fate-marker fractions for organoids found in the CSV.
 
-    The source CSVs are per-CELL (millions of rows), so parsing them is slow. The
-    computed per-organoid fractions are cached to `cache_path` (npz). A cached
-    result is reused when it is newer than every source CSV and already covers all
-    requested ids; otherwise it is recomputed and the cache refreshed. Pass
-    rebuild=True (or cache_path=None) to force the slow CSV path.
+    Returns (ids_found, percentages, col_names) where ids_found is the subset of
+    `ids` that appear in the fate CSV, in the same relative order as `ids`.
+    Organoids absent from the CSV are silently excluded (never zero-filled), so
+    the caller can filter its own arrays by the returned ids.
+
+    The slow CSV parse (millions of rows) is cached to `cache_path`. The cache
+    stores only found organoids. Pass update=True to force a rebuild.
     """
     ids = np.asarray(ids).astype(str)
     csv_paths = [os.path.join(data_root, ds, csv_name) for ds in sorted(set(datasets))]
     csv_paths = [p for p in csv_paths if os.path.exists(p)]
 
-    if cache_path and not rebuild and os.path.exists(cache_path):
+    cache_ids, cache_P, col_names = None, None, None
+    if cache_path and not update and os.path.exists(cache_path):
         fresh = not csv_paths or (
             os.path.getmtime(cache_path) >= max(os.path.getmtime(p) for p in csv_paths))
         if fresh:
             z = np.load(cache_path, allow_pickle=True)
-            pos = {u: i for i, u in enumerate(z["ids"].astype(str))}
-            if all(u in pos for u in ids):                  # cache covers every requested id
-                rows = [pos[u] for u in ids]
-                return z["percentages"][rows], list(z["col_names"])
+            if "found_only" in z:               # new-format cache (found ids only)
+                cache_ids = z["ids"].astype(str)
+                cache_P   = z["percentages"]
+                col_names = list(z["col_names"])
 
-    P, col_names = _fate_from_csv(data_root, ids, datasets, csv_name)
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        np.savez(cache_path, ids=ids, percentages=P, col_names=np.array(col_names))
-    return P, col_names
+    if cache_ids is None:                       # cold start or stale/old-format cache
+        cache_ids, cache_P, col_names = _fate_from_csv(data_root, datasets, csv_name)
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            np.savez(cache_path, ids=cache_ids, percentages=cache_P,
+                     col_names=np.array(col_names), found_only=np.array([True]))
+
+    cache_pos = {u: i for i, u in enumerate(cache_ids)}
+    found_mask = np.array([u in cache_pos for u in ids])
+    ids_found  = ids[found_mask]
+    rows       = [cache_pos[u] for u in ids_found]
+    return ids_found, cache_P[rows], col_names
