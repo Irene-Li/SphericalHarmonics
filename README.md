@@ -27,16 +27,18 @@ The viewer requires three things:
 3. **The original meshes** — the `.vtp` files, one per organoid, as generated at
    the start of the pipeline.
 
-No coefficient files, eigendecompositions, or transformed `.obj` meshes are
-needed — the `.vtp` files are read directly.
+By default no coefficient files, eigendecompositions, or transformed `.obj`
+meshes are needed — the `.vtp` files are read directly. (An optional
+`--source pipeline` mode does use those precomputed outputs for extra shape
+overlays; see [Optional: `--source pipeline`](#optional---source-pipeline) below.)
 
 ---
 
 ## Data layout
 
-The meshes come from two datasets, `main_dataset` and `sup_dataset`, kept in
-their original structure. The IDs in the embedding `.npz` refer directly to that
-structure:
+The meshes come from three datasets, `main_dataset`, `sup_dataset`, and `pert`,
+kept in their original structure. The IDs in the embedding `.npz` refer directly
+to that structure:
 
 ```
 organoid-viewer/
@@ -60,15 +62,30 @@ organoid-viewer/
     │       ├── day4/
     │       ├── day4p5/
     │       └── day4p5-more/
-    └── sup_dataset/
+    ├── sup_dataset/
+    │   ├── config.json
+    │   └── vtp/
+    │       └── day4p5/         #   day4p5_B02_100.vtp, ...
+    └── pert/                   # perturbation dataset — drug-treated organoids
         ├── config.json
         └── vtp/
-            └── day4p5/         #   day4p5_B02_100.vtp, ...
+            ├── normal/         #   abs-Iwp2_day4p5_G06_184.vtp, ...
+            └── small/          #   sec-DaptHi_day4p5_F02_103.vtp, ...
 ```
 
-This is the standard `{dataset}/vtp/{timepoint}/{filename}.vtp` layout, so no
-rearranging is needed — `--data_root` simply points at the folder that contains
-`main_dataset` and `sup_dataset` (here, `Data`).
+`main_dataset` and `sup_dataset` use the standard
+`{dataset}/vtp/{timepoint}/{filename}.vtp` layout. `pert` differs in two ways,
+but needs no rearranging either:
+
+- Its `vtp/` subfolders are a **shape-size split** (`normal` / `small`), not
+  timepoints — every `pert` organoid is day `4p5`.
+- Its filenames are prefixed with the **drug condition**
+  (`{condition}_day4p5_{well}_{label}.vtp`, e.g. `abs-Iwp2_day4p5_G06_184.vtp`),
+  whereas `main_dataset` / `sup_dataset` filenames are plain
+  `{timepoint}_{well}_{label}.vtp`.
+
+`--data_root` simply points at the folder that contains all three dataset folders
+(here, `Data`).
 
 > Internally each mesh is located by filename, searching `--data_root`
 > recursively, so any directory arrangement works as long as the `.vtp` files
@@ -76,16 +93,22 @@ rearranging is needed — `--data_root` simply points at the folder that contain
 
 ### How IDs map to files
 
-Each organoid ID is the **dataset name** followed by the mesh's **filename stem**
-(`{timepoint}_{well}_{label}`), and resolves to a `.vtp` like this:
+Each organoid ID is the **dataset name** followed by the mesh's **filename stem**,
+and resolves to a `.vtp` like this:
 
 ```
-main_dataset_day2p5_A04_67   →   Data/main_dataset/vtp/day2p5/day2p5_A04_67.vtp
-sup_dataset_day4p5_B02_100   →   Data/sup_dataset/vtp/day4p5/day4p5_B02_100.vtp
+main_dataset_day2p5_A04_67        →  Data/main_dataset/vtp/day2p5/day2p5_A04_67.vtp
+sup_dataset_day4p5_B02_100        →  Data/sup_dataset/vtp/day4p5/day4p5_B02_100.vtp
+pert_abs-Iwp2_day4p5_G06_184      →  Data/pert/vtp/normal/abs-Iwp2_day4p5_G06_184.vtp
 ```
 
-So the embedding only references meshes that already exist in the `main_dataset`
-and `sup_dataset` folders; nothing needs to be renamed or copied.
+For `pert`, the stem carries the drug condition (`abs-Iwp2`, `sec-DaptHi`, …) as
+its first token. Note the `normal` / `small` subfolder is **not** part of the ID:
+meshes are located by filename, searched recursively under `--data_root`, so the
+viewer finds the file whichever subfolder it sits in.
+
+So the embedding only references meshes that already exist in the three dataset
+folders; nothing needs to be renamed or copied.
 
 ---
 
@@ -113,20 +136,38 @@ python inspect_embedding.py --embedding hks_emb.npz --data_root Data
 ```
 
 - `--embedding` — path to the `.npz` embedding file.
-- `--data_root` — the folder containing `main_dataset` and `sup_dataset`
-  (searched recursively for the `.vtp` files).
+- `--data_root` — the root data folder, `Data`. It is searched recursively for
+  the `.vtp` files, so it only needs to sit above the dataset folders.
 
 Two windows open:
 
 - **Embedding window** — a 2D scatter plot, one dot per organoid. The "color by"
-  buttons on the left recolor the dots. Clicking a dot loads that organoid's 3D
-  mesh.
-- **Organoid window** — the 3D mesh. Drag to rotate, scroll to zoom. When the
-  meshes carry per-vertex fate-marker fields, the mesh options panel switches
-  which field colors the surface.
+  buttons on the left recolor the dots — by timepoint, cluster, complexity,
+  cell-type diversity, per-marker fate fraction, or **condition** (WT vs the
+  `pert` drug treatments). Clicking a dot loads that organoid's 3D mesh.
+- **Organoid window** — the 3D mesh. Drag to rotate, scroll to zoom. A draggable
+  **"Colour organoid by"** panel lists the per-vertex fate markers; click one to
+  colour the surface by it, and the choice persists as you click through
+  organoids.
 
 Dragging the two windows apart keeps them from overlapping. Closing either window
 quits.
+
+### Optional: `--source pipeline`
+
+By **default** the viewer reads meshes straight from the `.vtp` files
+(`--source vtp`) and needs nothing else — this is the self-contained mode the
+rest of this README assumes.
+
+Passing `--source pipeline` instead loads precomputed per-organoid pipeline
+outputs (`{stem}_coeffs.npz` + `{stem}_transformed_mesh.obj`, written by
+`run_new_meshes.py`) and unlocks extra shape overlays: the **"Colour organoid
+by"** panel gains an **HKS / shape** section (raw heat-kernel signatures at
+several diffusion times, plus bag-of-features words) alongside the fate markers.
+
+This requires having run that processing first, so those files exist under
+`--data_root`; without them the meshes won't load. If you only have the `.vtp`
+meshes, stay on the default `--source vtp`.
 
 ---
 
