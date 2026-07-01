@@ -90,6 +90,20 @@ def montage(pd, fields, out):
     print("wrote", out)
 
 
+def _activate_macos_app():
+    """A VTK (Cocoa) window launched from a terminal-run script never becomes the
+    active macOS app, so it receives mouse events but not keyboard focus — which
+    is why n / p did nothing even after clicking the window. Promote the process
+    to a regular app and bring it to the front so key presses are delivered."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+        app = NSApplication.sharedApplication()
+        app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        app.activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
+
+
 def interactive(pd, field):
     names = array_names(pd)
     state = {'i': names.index(field) if field in names else 0}
@@ -120,16 +134,21 @@ def interactive(pd, field):
         rw.Render()
 
     def keypress(obj, _ev):
-        k = obj.GetKeySym()
+        k = obj.GetKeySym() or obj.GetKeyCode()   # KeySym can be empty on macOS
         if k in ('n', 'p'):
             state['i'] = (state['i'] + (1 if k == 'n' else -1)) % len(names)
             set_field(names[state['i']])
+            print(f"  [{state['i'] + 1}/{len(names)}] {names[state['i']]}")
 
     iren.AddObserver('KeyPressEvent', keypress)
     ren.ResetCamera()
+    # Initialize() must run before Start(), and the app must be activated, or on
+    # macOS keyboard events never reach the observer (mouse still works).
+    iren.Initialize()
     rw.Render()
+    _activate_macos_app()
     print("fields:", names)
-    print("keys: n / p = next / previous field,  q = quit")
+    print("keys (with the render window focused): n / p = next / previous field,  q = quit")
     iren.Start()
 
 

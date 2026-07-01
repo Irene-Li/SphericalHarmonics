@@ -308,6 +308,16 @@ def main():
         cat_cmaps["agg_cluster"] = (["lightgrey"] + hi) if 0 in uniq_ag else hi
         color_options.insert(4, "agg_cluster")
 
+    # distance to the organoid's aggregated-cluster centre in weighted-HKS space
+    # (saved by dim_red as 'centre_dist'; 0 = at the centre / most representative).
+    # Continuous; reversed viridis so near-centre reads bright, with a robust
+    # upper clip so a few far outliers don't wash out the scale.
+    if "centre_dist" in emb:
+        cdist = emb["centre_dist"].astype(float)
+        hi_clip = float(np.percentile(cdist, 98)) if np.isfinite(cdist).any() else None
+        color_fields["centre_dist"] = (cdist, "viridis_r", (0.0, hi_clip) if hi_clip else None)
+        color_options.insert(5, "centre_dist")
+
     # uid_groups membership (categorical): point-field saved by double_clustering
     # as 'uid_group' (0 = none, g+1 = membership in hand-picked group g).
     if "uid_group" in emb:
