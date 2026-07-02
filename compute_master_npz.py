@@ -12,7 +12,7 @@ Arrays saved:
   mass_areas          (N,)              modes-mesh area               (mass_matrix diag sum)
   fracs               (N,)              reconstruction quality        (lower = better)
   complexity_errors   (N, 9)            recon error at lmax = 0..8 (col i = SH degrees 0..i)
-  l_cross_values      (N,)              interpolated lmax (max SH degree) where error crosses 0.015
+  l_cross_values      (N,)              interpolated lmax (max SH degree) where error crosses 0.005
 
   (when --fate is set)
   fate_names          (n_fates,)        ordered fate marker names (intersection across datasets)
@@ -68,7 +68,7 @@ DEFAULT_OUT     = "Data/npz/master.npz"
 
 SPARSE_TS           = [1, 4, 25, 100]
 COMPLEXITY_LMAX     = 9
-L_CROSS_THRESHOLD   = 0.015
+L_CROSS_THRESHOLD   = 0.005
 N_VARIABLE_TS       = 20
 
 VOCABS = [
