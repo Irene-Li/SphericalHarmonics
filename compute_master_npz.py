@@ -63,7 +63,7 @@ from src.fatemarkers import FateMarkers
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_FOLDERS = ["Data/main_dataset", "Data/sup_dataset", "Data/pert"]
+DEFAULT_FOLDERS = ["Data/main_dataset", "Data/sup_dataset", "Data/pert2"]
 DEFAULT_OUT     = "Data/npz/master.npz"
 
 SPARSE_TS           = [1, 4, 25, 100]
