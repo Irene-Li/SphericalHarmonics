@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 import numpy as np
 import plotly.graph_objects as go
@@ -84,16 +85,38 @@ def vtp_flat_path(data_path, cfg, label_uid):
     return f"{data_path}/{cfg.get('vtp_dir', 'vtp')}/{timepoint}/{label_uid}.vtp"
 
 
+def _vtp_flat_fm_path(data_path, cfg, label_uid, suffix):
+    """Locate an fm_data file for a vtp_flat organoid.
+
+    Fast path: the first uid token is the timepoint subfolder (main/sup:
+    'day4p5_A06_11' -> vtp/day4p5/...). Fallback: the timepoint folder is NOT
+    encoded in the uid (pert/pert2: folders are 'normal'/'small' but the uid
+    leads with the drug token, e.g. 'sec-DaptHi_day4p5_F02_47'), so search the
+    configured timepoints, else glob the vtp subfolders. Returns the fast-path
+    candidate if nothing is found (caller handles the missing file)."""
+    vtp_dir = cfg.get("vtp_dir", "vtp")
+    fname = f"{label_uid}{suffix}"
+    guess = f"{data_path}/{vtp_dir}/{label_uid.split('_')[0]}/fm_data/{fname}"
+    if os.path.exists(guess):
+        return guess
+    tps = cfg.get("timepoints")
+    subdirs = ([f"{data_path}/{vtp_dir}/{t}" for t in tps] if tps
+               else glob.glob(f"{data_path}/{vtp_dir}/*"))
+    for d in subdirs:
+        cand = f"{d}/fm_data/{fname}"
+        if os.path.exists(cand):
+            return cand
+    return guess
+
+
 def vtp_flat_obj_path(data_path, cfg, label_uid):
     """PCA-transformed mesh (.obj) for a vtp_flat organoid."""
-    timepoint = label_uid.split("_")[0]
-    return f"{data_path}/{cfg.get('vtp_dir', 'vtp')}/{timepoint}/fm_data/{label_uid}_transformed_mesh.obj"
+    return _vtp_flat_fm_path(data_path, cfg, label_uid, "_transformed_mesh.obj")
 
 
 def vtp_flat_coeffs_path(data_path, cfg, label_uid):
     """Saved coefficients (.npz) for a vtp_flat organoid."""
-    timepoint = label_uid.split("_")[0]
-    return f"{data_path}/{cfg.get('vtp_dir', 'vtp')}/{timepoint}/fm_data/{label_uid}_coeffs.npz"
+    return _vtp_flat_fm_path(data_path, cfg, label_uid, "_coeffs.npz")
 
 
 def organoid_obj_path(data_path, cfg, uid):

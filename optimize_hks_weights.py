@@ -242,7 +242,7 @@ def main():
     parser.add_argument("--drop_vocab", type=int, nargs="*", default=[],
                         help="vocab indices to delete entirely (the drop mask), e.g. --drop_vocab 2 4; "
                              "deleted vocabs get zero weight and the rest adapt to their absence")
-    parser.add_argument("--conf_thr", type=float, default=0.9,
+    parser.add_argument("--conf_thr", type=float, default=1,
                         help="keep organoid pairs with chamfer below this absolute threshold as "
                              "confident correlation supervision (see chamfer distribution plot)")
     parser.add_argument("--beta_group", type=float, default=0.15,

@@ -36,7 +36,7 @@ overlays; see [Optional: `--source pipeline`](#optional---source-pipeline) below
 
 ## Data layout
 
-The meshes come from three datasets, `main_dataset`, `sup_dataset`, and `pert`,
+The meshes come from three datasets, `main_dataset`, `sup_dataset`, and `pert2`,
 kept in their original structure. The IDs in the embedding `.npz` refer directly
 to that structure:
 
@@ -66,23 +66,25 @@ organoid-viewer/
     │   ├── config.json
     │   └── vtp/
     │       └── day4p5/         #   day4p5_B02_100.vtp, ...
-    └── pert/                   # perturbation dataset — drug-treated organoids
+    └── pert2/                  # perturbation dataset — drug-treated organoids
         ├── config.json
         └── vtp/
-            ├── normal/         #   abs-Iwp2_day4p5_G06_184.vtp, ...
-            └── small/          #   sec-DaptHi_day4p5_F02_103.vtp, ...
+            ├── normal/         #   stem-ChirVpaD1_day4p5_C06_101.vtp, ta-Yapa_day4p5_B03_3.vtp, ...
+            └── small/          #   abs-Iwp2_day4p5_G06_10.vtp, sec-DaptHi_day4p5_F02_103.vtp, sec-DaptIwp2iMekD1_day4p5_C04_1.vtp, ...
 ```
 
 `main_dataset` and `sup_dataset` use the standard
-`{dataset}/vtp/{timepoint}/{filename}.vtp` layout. `pert` differs in two ways,
+`{dataset}/vtp/{timepoint}/{filename}.vtp` layout. `pert2` differs in two ways,
 but needs no rearranging either:
 
 - Its `vtp/` subfolders are a **shape-size split** (`normal` / `small`), not
-  timepoints — every `pert` organoid is day `4p5`.
+  timepoints — every `pert2` organoid is day `4p5`.
 - Its filenames are prefixed with the **drug condition**
-  (`{condition}_day4p5_{well}_{label}.vtp`, e.g. `abs-Iwp2_day4p5_G06_184.vtp`),
+  (`{condition}_day4p5_{well}_{label}.vtp`, e.g. `stem-ChirVpaD1_day4p5_C06_101.vtp`),
   whereas `main_dataset` / `sup_dataset` filenames are plain
-  `{timepoint}_{well}_{label}.vtp`.
+  `{timepoint}_{well}_{label}.vtp`. The five conditions are `stem-ChirVpaD1` and
+  `ta-Yapa` (in `normal`), and `abs-Iwp2`, `sec-DaptHi`, and `sec-DaptIwp2iMekD1`
+  (in `small`).
 
 `--data_root` simply points at the folder that contains all three dataset folders
 (here, `Data`).
@@ -97,13 +99,14 @@ Each organoid ID is the **dataset name** followed by the mesh's **filename stem*
 and resolves to a `.vtp` like this:
 
 ```
-main_dataset_day2p5_A04_67        →  Data/main_dataset/vtp/day2p5/day2p5_A04_67.vtp
-sup_dataset_day4p5_B02_100        →  Data/sup_dataset/vtp/day4p5/day4p5_B02_100.vtp
-pert_abs-Iwp2_day4p5_G06_184      →  Data/pert/vtp/normal/abs-Iwp2_day4p5_G06_184.vtp
+main_dataset_day2p5_A04_67           →  Data/main_dataset/vtp/day2p5/day2p5_A04_67.vtp
+sup_dataset_day4p5_B02_100           →  Data/sup_dataset/vtp/day4p5/day4p5_B02_100.vtp
+pert2_stem-ChirVpaD1_day4p5_C06_101  →  Data/pert2/vtp/normal/stem-ChirVpaD1_day4p5_C06_101.vtp
 ```
 
-For `pert`, the stem carries the drug condition (`abs-Iwp2`, `sec-DaptHi`, …) as
-its first token. Note the `normal` / `small` subfolder is **not** part of the ID:
+For `pert2`, the stem carries the drug condition (`stem-ChirVpaD1`, `abs-Iwp2`,
+`sec-DaptHi`, …) as its first token. Note the `normal` / `small` subfolder is
+**not** part of the ID:
 meshes are located by filename, searched recursively under `--data_root`, so the
 viewer finds the file whichever subfolder it sits in.
 
@@ -144,7 +147,7 @@ Two windows open:
 - **Embedding window** — a 2D scatter plot, one dot per organoid. The "color by"
   buttons on the left recolor the dots — by timepoint, cluster, complexity,
   cell-type diversity, per-marker fate fraction, or **condition** (WT vs the
-  `pert` drug treatments). Clicking a dot loads that organoid's 3D mesh.
+  `pert2` drug treatments). Clicking a dot loads that organoid's 3D mesh.
 - **Organoid window** — the 3D mesh. Drag to rotate, scroll to zoom. A draggable
   **"Colour organoid by"** panel lists the per-vertex fate markers; click one to
   colour the surface by it, and the choice persists as you click through
