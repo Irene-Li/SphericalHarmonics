@@ -2,7 +2,7 @@
 Compute a symmetric chamfer-distance matrix between high-complexity organoids.
 
 Chamfer distance is used as *trustworthy-when-small* supervision for learning HKS
-spectrum weights (see double_clustering.ipynb). Because it is only meaningful for
+spectrum weights (see optimize_hks_weights.py). Because it is only meaningful for
 already-aligned meshes, we restrict to high-complexity organoids and read the
 PCA-transformed, cell-unit-rescaled meshes straight off disk (no re-alignment).
 
@@ -11,6 +11,9 @@ Scope (matches the weight-learning subset):
   - each mesh optionally AREA-NORMALISED to surface area 1 when NORMALISE_MESHES
     is True (OFF by default — the non-normalised chamfer is a better proxy for
     shape closeness here), then decimated by DECIMATE_FACTOR before chamfer
+  - meshes igl.decimate cannot collapse (non-manifold) are SKIPPED, not kept at
+    full resolution: chamfer is point-density dependent, so mixing a full-res
+    cloud with decimated ones would bias that organoid's distances
 
 Symmetric chamfer for two vertex point clouds A, B:
   cd(A, B) = mean_a min_b ||a - b||  +  mean_b min_a ||b - a||
@@ -36,7 +39,7 @@ from src import utils
 
 
 MASTER          = "Data/npz/master.npz"
-OUT             = "Data/npz/chamfer_update.npz"
+OUT             = "Data/npz/chamfer_highcomplexity.npz"
 L_CROSS_MIN     = 5.3   # lmax scale (degree)
 DECIMATE_FACTOR = 10
 VTP_CFG         = {"vtp_dir": "vtp"}   # both datasets use layout 'vtp_flat', vtp_dir 'vtp'
@@ -57,12 +60,19 @@ def _surface_area(v, f):
 
 
 def load_cloud(path):
-    """Read a mesh, optionally area-normalise, decimate, return vertices (M, 3).
+    """Read a mesh, optionally area-normalise, decimate, return vertices (M, 3),
+    or None if decimation fails.
 
     When NORMALISE_MESHES is True the vertices are scaled by 1/sqrt(area) so every
     mesh has surface area 1 (scale-invariant / pure-shape chamfer, matching the
     unit-area HKS). It is False by default here — the non-normalised chamfer is a
     better shape-closeness proxy for the weight learning.
+
+    Returns None when igl.decimate fails (ok=False / no faces) — a few source
+    meshes are non-manifold and can't be collapsed. Such a mesh must be SKIPPED,
+    not kept at full resolution: chamfer is point-density dependent, so mixing a
+    full ~18k-vertex cloud with everyone else's ~3.6k-vertex decimated clouds
+    would bias its distances. The caller drops these organoids.
     """
     v, f = igl.read_triangle_mesh(path)
     if NORMALISE_MESHES:
@@ -73,7 +83,9 @@ def load_cloud(path):
     ok, vd, fd, _, _ = igl.decimate(v, f, target_faces)
     # igl.decimate may leave unreferenced verts; keep only those used by a face.
     used = np.unique(fd)
-    return np.ascontiguousarray(vd[used]) if len(used) else v
+    if not ok or len(used) == 0:
+        return None                                     # non-manifold / undecimatable -> skip
+    return np.ascontiguousarray(vd[used])
 
 
 def chamfer(pts_a, tree_a, pts_b, tree_b):
@@ -119,7 +131,11 @@ def main():
         if not os.path.exists(path):
             print(f"  [skip] missing mesh: {path}")
             continue
-        clouds.append(load_cloud(path))
+        cloud = load_cloud(path)
+        if cloud is None:
+            print(f"  [skip] decimation failed (non-manifold mesh): {uid}")
+            continue
+        clouds.append(cloud)
         kept_ids.append(uid)
         kept_ds.append(ds)
 

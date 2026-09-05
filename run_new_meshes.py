@@ -1,3 +1,20 @@
+"""
+Compute per-organoid shape coefficients from meshes, writing each dataset's
+fm_data: <label>_coeffs.npz (PCA-aligned eigendecomposition + SH coeffs) and
+<label>_transformed_mesh.obj, plus good_labels_<timepoint>.npy.
+
+Dispatches on the dataset's config.json 'layout':
+  vtp_flat        {folder}/{vtp_dir}/{timepoint}/{label}.vtp   (main/sup/pert2; shape
+                  coefficients only, compute_fate=False)
+  fractal_output  the original per-well tree                    (also computes fate coeffs)
+
+Organoids listed in config['discard'].labels_to_discard_csv (built by
+manage_discards.py) are excluded from good_labels. --workers N parallelises with
+one BLAS thread per worker; --reprocess recomputes even if outputs already exist.
+
+Run in the scmpx env, e.g.:
+  KMP_DUPLICATE_LIB_OK=TRUE python run_new_meshes.py Data/pert2 --workers 6
+"""
 from tqdm import tqdm
 from src.fatemarkers import FateMarkers
 import numpy as np

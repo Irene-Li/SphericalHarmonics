@@ -30,7 +30,7 @@ Saves the learned (n_modes, n_vocab) weight matrix + metadata so dim_red.ipynb c
 load and apply it.
 
 Run in the scmpx env:
-    KMP_DUPLICATE_LIB_OK=TRUE /opt/homebrew/anaconda3/envs/scmpx/bin/python optimize_hks_weights.py
+    python optimize_hks_weights.py
 """
 
 import argparse
@@ -235,19 +235,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--master", default="Data/npz/master.npz")
-    parser.add_argument("--chamfer", default="Data/npz/chamfer_update.npz")
+    parser.add_argument("--chamfer", default="Data/npz/chamfer_highcomplexity.npz")
     parser.add_argument("--out", default="Data/npz/hks_weights_full.npz")
     parser.add_argument("--mode_cut", type=int, default=8,
                         help="keep only the first this-many HKS modes (drop fine surface detail)")
     parser.add_argument("--drop_vocab", type=int, nargs="*", default=[],
                         help="vocab indices to delete entirely (the drop mask), e.g. --drop_vocab 2 4; "
                              "deleted vocabs get zero weight and the rest adapt to their absence")
-    parser.add_argument("--conf_thr", type=float, default=1,
+    parser.add_argument("--conf_thr", type=float, default=0.95,
                         help="keep organoid pairs with chamfer below this absolute threshold as "
                              "confident correlation supervision (see chamfer distribution plot)")
     parser.add_argument("--beta_group", type=float, default=0.15,
                         help="weight of the hand-picked-group compactness term")
-    parser.add_argument("--cv_threshold", type=float, default=0.1,
+    parser.add_argument("--cv_threshold", type=float, default=0.05,
                         help="zero out features whose weight coefficient-of-variation across "
                              "restarts exceeds this (unstable = poorly determined = unimportant)")
     parser.add_argument("--restarts", type=int, default=30)

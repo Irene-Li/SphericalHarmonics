@@ -26,11 +26,12 @@ Arrays saved:
 
 Usage:
   python compute_master_npz.py [--folders DIR [DIR ...]] [--out PATH] [--fate]
-                               [--workers N] [--update]
+                               [--workers N] [--update] [--bof-only]
                                [--l-cross-threshold T] [--recompute-l-cross]
+                               [--recompute-meta]
 
 Defaults:
-  --folders  Data/main_dataset Data/sup_dataset
+  --folders  Data/main_dataset Data/sup_dataset Data/pert2
   --out      Data/npz/master.npz
   --workers  1
 
@@ -47,6 +48,16 @@ it to pick a complexity threshold (see complexity_analysis.ipynb) without
 rebuilding the npz, e.g.
   python compute_master_npz.py --recompute-l-cross --l-cross-threshold 0.02
 --l-cross-threshold also applies to full and --update runs.
+
+--bof-only re-projects HKS onto the current sim/vocab_*.npz, replacing ONLY the
+hks_bof_coeffs__* arrays in an existing --out and keeping every vocab-independent
+array (l_cross, complexity_errors, areas, hks_coeffs_sparse, ...). Loads each
+_coeffs.npz (not the .obj), so it is the cheap way to update master after a vocab
+change instead of a full rebuild:
+  python compute_master_npz.py --bof-only
+
+--recompute-meta re-derives only the metadata arrays (times, conditions) for
+every row in an existing --out from the current configs; no meshes reprocessed.
 """
 
 import os
@@ -326,8 +337,8 @@ def intersect_fate_order(configs):
 
 def derive_time(cfg, timepoint):
     """Developmental-day label for a row. Config-driven so a dataset whose
-    subfolders are not days (e.g. pert: normal/small) can pin a constant day:
-      cfg['time']      -> constant for the whole dataset (e.g. pert: '4p5')
+    subfolders are not days (e.g. pert2: normal/small) can pin a constant day:
+      cfg['time']      -> constant for the whole dataset (e.g. pert2: '4p5')
       cfg['time_map']  -> {subfolder: day}
       otherwise        -> strip a leading 'day' (main/sup: 'day4p5' -> '4p5')."""
     if "time" in cfg:
@@ -341,7 +352,7 @@ def derive_condition(cfg, uid, timepoint):
     """Perturbation/genotype label for a row. Config-driven:
       cfg['condition']           -> constant (main/sup: 'WT')
       cfg['condition_map']       -> {subfolder: condition}
-      cfg['condition_uid_index'] -> uid.split('_')[i] (pert: 1 -> the drug token)
+      cfg['condition_uid_index'] -> uid.split('_')[i] (pert2: 1 -> the drug token)
       otherwise                  -> 'WT'."""
     if "condition" in cfg:
         return cfg["condition"]

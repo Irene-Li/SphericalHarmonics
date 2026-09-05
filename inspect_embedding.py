@@ -11,11 +11,11 @@ Two linked windows:
                            polyscope's mesh UI.
 
 The embedding is written by `src.utils.save_embedding` (e.g. from
-double_clustering.ipynb).
+dim_red.ipynb).
 
 The scatter can be colored by l_cross / area / time / condition or by any fate
 marker's percentage (the l=0 harmonic coefficient saved on the embedding as 'perc_<name>'
-point-fields by double_clustering.ipynb; log scale, shared range), or by
+point-fields by dim_red.ipynb; log scale, shared range), or by
 cell-type diversity (Hill numbers saved by dim_red.ipynb as 'hill_q<val>' point
 fields, one per order q in [0, 1]; magma, each q with its own colour range).
 
@@ -36,7 +36,7 @@ Mesh source is selectable with --source:
             Fate fields come from the saved fate coefficients when the npz has
             them (fractal_output runs with compute_fate=True); otherwise
             they're read from a matching .vtp if one is found
-            (main_dataset/sup_dataset/pert, which only save shape coefficients).
+            (main_dataset/sup_dataset/pert2, which only save shape coefficients).
 
 In both modes, --data_root is walked once and meshes/pipeline files are found
 by filename regardless of nesting, so any layout works.
@@ -124,7 +124,7 @@ def main():
     shape_clusters = emb["shape_cluster"].astype(float) if "shape_cluster" in emb else None
     # optional aggregated clusters (0 = low-complexity merged group, 1..n = high-complexity)
     agg_clusters = emb["agg_cluster"].astype(float) if "agg_cluster" in emb else None
-    # optional perturbation/genotype condition ('WT' or a pert drug token)
+    # optional perturbation/genotype condition ('WT' or a pert2 drug token)
     conditions = emb["condition"].astype(str) if "condition" in emb else None
     print(f"Loaded {len(ids)} points from {args.embedding} (method={method})")
 
@@ -233,7 +233,7 @@ def main():
         return result
 
     # ---- fate percentages from the embedding ---------------------------
-    # double_clustering saves each fate as a 'perc_<name>' point-field: the
+    # dim_red saves each fate as a 'perc_<name>' point-field: the
     # lowest-order (l=0) harmonic coefficient / sqrt(area), i.e. the fraction of
     # surface covered by that marker in [0, 1]. No cell-type CSV needed.
     fate_labels = [k[len("perc_"):] for k in emb if k.startswith("perc_")]
@@ -318,7 +318,7 @@ def main():
         color_fields["centre_dist"] = (cdist, "viridis_r", (0.0, hi_clip) if hi_clip else None)
         color_options.insert(5, "centre_dist")
 
-    # uid_groups membership (categorical): point-field saved by double_clustering
+    # uid_groups membership (categorical): point-field saved by dim_red
     # as 'uid_group' (0 = none, g+1 = membership in hand-picked group g).
     if "uid_group" in emb:
         grp_code = emb["uid_group"].astype(float)
@@ -345,7 +345,7 @@ def main():
             print(f"trusted: {int(is_trusted.sum())} of {len(ids)} points")
 
     # perturbation/genotype condition (categorical): point-field 'condition'
-    # saved by dim_red ('WT' for the wild-type datasets, the drug token for pert).
+    # saved by dim_red ('WT' for the wild-type datasets, the drug token for pert2).
     if conditions is not None:
         uniq_cond = sorted(set(conditions))
         if len(uniq_cond) > 1:
