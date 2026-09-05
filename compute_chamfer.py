@@ -7,10 +7,10 @@ already-aligned meshes, we restrict to high-complexity organoids and read the
 PCA-transformed, cell-unit-rescaled meshes straight off disk (no re-alignment).
 
 Scope (matches the weight-learning subset):
-  - organoids with l_cross_value > L_CROSS_MIN  (~566 of 3064)
-  - each mesh AREA-NORMALISED to surface area 1 (so chamfer is scale-invariant /
-    pure shape, matching the unit-area HKS normalisation), then decimated by
-    DECIMATE_FACTOR (~50k -> ~5k verts) before chamfer
+  - organoids with l_cross_value > L_CROSS_MIN
+  - each mesh optionally AREA-NORMALISED to surface area 1 when NORMALISE_MESHES
+    is True (OFF by default — the non-normalised chamfer is a better proxy for
+    shape closeness here), then decimated by DECIMATE_FACTOR before chamfer
 
 Symmetric chamfer for two vertex point clouds A, B:
   cd(A, B) = mean_a min_b ||a - b||  +  mean_b min_a ||b - a||
@@ -37,7 +37,7 @@ from src import utils
 
 MASTER          = "Data/npz/master.npz"
 OUT             = "Data/npz/chamfer_update.npz"
-L_CROSS_MIN     = 5.3   # lmax scale (degree); = old 6.3 on the pre-shift 1..9 scale
+L_CROSS_MIN     = 5.3   # lmax scale (degree)
 DECIMATE_FACTOR = 10
 VTP_CFG         = {"vtp_dir": "vtp"}   # both datasets use layout 'vtp_flat', vtp_dir 'vtp'
 NORMALISE_MESHES  = False
@@ -57,11 +57,12 @@ def _surface_area(v, f):
 
 
 def load_cloud(path):
-    """Read a mesh, AREA-NORMALISE it, decimate, return decimated vertices (M, 3).
+    """Read a mesh, optionally area-normalise, decimate, return vertices (M, 3).
 
-    Vertices are scaled by 1/sqrt(area) so every mesh has surface area 1 — making
-    chamfer scale-invariant (pure shape discrepancy), to match the unit-area HKS
-    normalisation. Without this, chamfer is dominated by organoid size.
+    When NORMALISE_MESHES is True the vertices are scaled by 1/sqrt(area) so every
+    mesh has surface area 1 (scale-invariant / pure-shape chamfer, matching the
+    unit-area HKS). It is False by default here — the non-normalised chamfer is a
+    better shape-closeness proxy for the weight learning.
     """
     v, f = igl.read_triangle_mesh(path)
     if NORMALISE_MESHES:
@@ -145,7 +146,17 @@ def main():
     C = C + C.T   # symmetrize (diagonal stays 0)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.savez(args.out, ids=kept_ids, C=C)
+    # provenance: the parameters that produced this matrix, so the file is
+    # self-describing (which master, l_cross window, area-normalisation, etc.)
+    np.savez(args.out, ids=kept_ids, C=C,
+             meta_master=str(args.master),
+             meta_l_cross_min=float(args.l_cross_min),
+             meta_l_cross_max=float(args.l_cross_max),
+             meta_normalise_meshes=bool(NORMALISE_MESHES),
+             meta_decimate_factor=int(DECIMATE_FACTOR),
+             meta_sample=int(args.sample),
+             meta_seed=int(args.seed),
+             meta_n=int(n))
     iu = np.triu_indices(n, k=1)
     print(f"\nSaved -> {args.out}   C {C.shape}")
     print(f"chamfer off-diagonal: min {C[iu].min():.4f}  median {np.median(C[iu]):.4f}  "

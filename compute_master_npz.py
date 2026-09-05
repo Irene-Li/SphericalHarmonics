@@ -57,6 +57,8 @@ from tqdm import tqdm
 import concurrent.futures
 
 from src.fatemarkers import FateMarkers
+from src import utils
+from types import SimpleNamespace
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,72 @@ def compute_bof_coeffs(m, vocabs):
         encoding   = encode_vocab(hks_scaled, v)
         out[v["name"]] = m.modes.T @ (m.mass_matrix @ encoding)
     return out
+
+
+# ---------------------------------------------------------------------------
+# --bof-only: re-project HKS onto the current vocab, updating ONLY the bof
+# arrays of an existing master. Loads each organoid's saved eigendecomposition
+# (_coeffs.npz) — NOT the .obj — and reruns the full per-vertex encoding via
+# compute_bof_coeffs, so the result is identical to a full rebuild's bof (the
+# HKS->encoding nonlinearity is applied per vertex, then SH-projected) but skips
+# the .obj read and the complexity/hks_sparse/frac recompute. Everything
+# vocab-independent (l_cross, complexity_errors, areas, ...) is kept verbatim.
+# ---------------------------------------------------------------------------
+_BOF_ONLY_CFG = {"vtp_dir": "vtp"}   # all vtp_flat datasets
+_BOF_ONLY_VOCABS = None
+
+
+def _bof_only_init(n_threads, vocabs):
+    _worker_init(n_threads)
+    global _BOF_ONLY_VOCABS
+    _BOF_ONLY_VOCABS = vocabs
+
+
+def _bof_only_one(task):
+    """(uid, dataset) -> (uid, bof dict). Loads only the eigendecomposition."""
+    uid, dataset = task
+    bare = uid[len(dataset) + 1:]
+    d = np.load(utils.vtp_flat_coeffs_path(f"Data/{dataset}", _BOF_ONLY_CFG, bare),
+                allow_pickle=True)
+    m = SimpleNamespace(area=float(d["area"]), eigvals=d["eigvals"], eigvecs=d["eigvecs"],
+                        modes=d["modes"], mass_matrix=d["mass_matrix"].item())
+    return uid, compute_bof_coeffs(m, _BOF_ONLY_VOCABS)
+
+
+def run_bof_only(out_path, vocabs, workers):
+    """Update ONLY the bof arrays of the existing master at out_path in place."""
+    if not vocabs:
+        raise SystemExit("--bof-only: no vocabs configured/found (see VOCABS / sim/).")
+    if not os.path.exists(out_path):
+        raise SystemExit(f"--bof-only: {out_path} does not exist (nothing to update).")
+    existing = dict(np.load(out_path, allow_pickle=True))
+    ids      = existing["ids"].astype(str)
+    datasets = existing["datasets"].astype(str)
+    print(f"--bof-only: re-projecting {len(ids)} organoids onto "
+          f"{[v['name'] for v in vocabs]} (vocab-independent arrays kept verbatim)")
+    tasks = list(zip(ids, datasets))
+
+    results = {}
+    if workers == 1:
+        global _BOF_ONLY_VOCABS
+        _BOF_ONLY_VOCABS = vocabs
+        for t in tqdm(tasks, desc="bof-only"):
+            uid, bof = _bof_only_one(t)
+            results[uid] = bof
+    else:
+        tpw = max(1, 8 // workers)
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers, initializer=_bof_only_init, initargs=(tpw, vocabs)) as ex:
+            for uid, bof in tqdm(ex.map(_bof_only_one, tasks), total=len(tasks), desc="bof-only"):
+                results[uid] = bof
+
+    for v in vocabs:
+        existing[f"hks_bof_coeffs__{v['name']}"] = np.array([results[u][v["name"]] for u in ids])
+    existing["bof_vocab_names"] = np.array([v["name"] for v in vocabs])
+    np.savez(out_path, **existing)
+    print(f"Updated {out_path}: replaced bof arrays, kept everything else.")
+    for v in vocabs:
+        print(f"  hks_bof_coeffs__{v['name']}  {existing['hks_bof_coeffs__'+v['name']].shape}")
 
 
 def fate_field(annotation_names, name):
@@ -452,6 +520,11 @@ def main():
                     help="only re-derive the metadata arrays (times, conditions) for every row "
                          "in an existing --out from the current configs; no meshes are reprocessed. "
                          "Use it to fix labels or backfill 'conditions' before an --update.")
+    ap.add_argument("--bof-only", action="store_true",
+                    help="only re-project HKS onto the current vocab, replacing the "
+                         "hks_bof_coeffs__* arrays in an existing --out and keeping every "
+                         "vocab-independent array. Loads each _coeffs.npz (not the .obj); "
+                         "use after changing sim/vocab_*.npz instead of a full rebuild.")
     args = ap.parse_args()
 
     # Fast path: just re-derive l_cross from the already-stored per-degree errors
@@ -475,6 +548,13 @@ def main():
         return
 
     vocabs  = load_vocabs()
+
+    # Fast path: re-project onto the current vocab only (after a vocab change),
+    # keeping every vocab-independent array. No configs/meshes-as-obj needed.
+    if args.bof_only:
+        run_bof_only(args.out, vocabs, args.workers)
+        return
+
     configs = [load_config(fp) for fp in args.folders]
 
     fate_order = intersect_fate_order(configs) if args.fate else []

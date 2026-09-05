@@ -118,6 +118,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--suffix", default="",
+                    help="appended to the output vocab filenames (e.g. '_reprocheck' to "
+                         "write beside the live vocab without overwriting it)")
     args = ap.parse_args()
 
     save_paths = gather_save_paths()
@@ -189,16 +192,38 @@ def main():
     sigma = float(np.sqrt(np.mean(dist ** 2)))
     vocab = np.array(centers)
     print(f"KMeans vocab {vocab.shape}  sigma={sigma:.6f}")
-    np.savez("sim/vocab_variable_time.npz", vocab=vocab, scaler=scaler, sigma=sigma)
-    print("saved sim/vocab_variable_time.npz")
+
+    # provenance: the recipe that produced this codebook, so the file records
+    # which datasets / knobs it was fit on (not just the fitted centres).
+    meta = dict(
+        meta_datasets=np.array(DATASETS),
+        meta_kmeans_k=KMEANS_K,
+        meta_pca_comps=PCA_COMPS,
+        meta_n_times=N_TIMES,
+        meta_decimate_face=DECIMATE_FACE,
+        meta_complexity_threshold=COMPLEXITY_THRESHOLD,
+        meta_complexity_intervals=np.array(COMPLEXITY_INTERVALS, dtype=float),
+        meta_recon_pctl=RECON_PCTL,
+        meta_curv_z=CURV_Z,
+        meta_seed=SEED,
+        meta_n_loaded=len(hkss),
+        meta_n_after_recon=len(filtered_hkss),
+        meta_samples_per_group=samples_per_group,
+        meta_n_train_points=int(collected_hks.shape[0]),
+        meta_n_curv_points=int(filtered_rescaled_hks.shape[0]),
+    )
+    km_out  = f"sim/vocab_variable_time{args.suffix}.npz"
+    pca_out = f"sim/vocab_pca_variable_time{args.suffix}.npz"
+
+    np.savez(km_out, vocab=vocab, scaler=scaler, sigma=sigma, **meta)
+    print(f"saved {km_out}")
 
     # ---- PCA vocab ----
     pca = PCA(n_components=PCA_COMPS).fit(filtered_rescaled_hks)
     print(f"PCA vocab components {pca.components_.shape}  "
           f"explained variance ratio {np.round(pca.explained_variance_ratio_, 4)}")
-    np.savez("sim/vocab_pca_variable_time.npz",
-             components=pca.components_, mean=pca.mean_, scaler=scaler)
-    print("saved sim/vocab_pca_variable_time.npz")
+    np.savez(pca_out, components=pca.components_, mean=pca.mean_, scaler=scaler, **meta)
+    print(f"saved {pca_out}")
 
 
 if __name__ == "__main__":
