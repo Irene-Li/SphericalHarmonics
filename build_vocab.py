@@ -13,10 +13,11 @@ It walks each dataset's config.json timepoints and reads
 vtp/<tp>/fm_data/good_labels_<tp>.npy. Eigenvalues/eigenvectors are NOT
 recomputed — they are read from the saved _coeffs.npz (run_new_meshes.py output).
 
-Speed: the slow per-mesh load is cached by build_hks_cache.py to
-sim/hks_cache_variable_time.npz; this script reads that cache when it matches the
-current good_labels + N_TIMES/DECIMATE_FACE, and rewrites it after any fresh load.
-Meshes igl.decimate cannot collapse (non-manifold) are skipped.
+Speed: the slow per-mesh load is cached (utils.build_hks_cache / load_hks_cache)
+to sim/hks_cache_variable_time.npz; this script reads that cache when it matches
+the current good_labels + N_TIMES/DECIMATE_FACE and (re)builds it on a miss, a
+stale cache, or --refresh-cache. Meshes igl.decimate cannot collapse
+(non-manifold) are skipped.
 
 Outputs (format read unchanged by compute_master_npz; +meta_* provenance keys):
   sim/vocab_variable_time.npz       vocab (KMEANS_K, N_TIMES), scaler (Normalizer), sigma
@@ -31,16 +32,15 @@ Run in the scmpx env:
 import os
 import json
 import argparse
-import concurrent.futures
 
 import numpy as np
-from tqdm import tqdm
 import igl
 from sklearn.preprocessing import Normalizer
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
 from src.fatemarkers import FateMarkers
+from src import utils
 
 DATASETS      = ["Data/main_dataset", "Data/sup_dataset", "Data/pert2"]
 N_TIMES       = 20
@@ -52,12 +52,7 @@ COMPLEXITY_INTERVALS = [(0, 5.3), (5.3, np.inf)]
 RECON_PCTL    = 100
 CURV_Z        = 4
 SEED          = 42
-CACHE_PATH    = "sim/hks_cache_variable_time.npz"   # built by build_hks_cache.py
-
-
-def _init_worker(n_threads):
-    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-        os.environ[var] = str(n_threads)
+CACHE_PATH    = "sim/hks_cache_variable_time.npz"   # HKS cache (utils.build_hks_cache / load_hks_cache)
 
 
 def find_times(area, n=N_TIMES):
@@ -125,45 +120,6 @@ def gather_save_paths():
     return paths
 
 
-def _load_from_cache(save_paths):
-    """(hkss, fracs, complexities) from the HKS cache if it matches the current
-    good_labels + params, else None. See build_hks_cache.py."""
-    if not os.path.exists(CACHE_PATH):
-        return None
-    z = np.load(CACHE_PATH, allow_pickle=True)
-    if (int(z['meta_n_times']) != N_TIMES or int(z['meta_decimate_face']) != DECIMATE_FACE
-            or not np.array_equal(z['input_save_paths'].astype(str),
-                                  np.asarray(save_paths, dtype=str))):
-        print(f"  [cache {CACHE_PATH} stale (good_labels or params changed) — reloading meshes]")
-        return None
-    hkss = np.split(z['hks'], np.cumsum(z['lengths'])[:-1])
-    fracs, comps = z['fracs'], z['complexities']
-    keep = np.array([h.shape[0] > 0 for h in hkss])          # drop degenerate (empty-HKS) meshes
-    if not keep.all():
-        print(f"  [cache] dropping {int((~keep).sum())} degenerate (empty-HKS) organoids")
-        hkss  = [h for h, k in zip(hkss, keep) if k]
-        fracs, comps = fracs[keep], comps[keep]
-    return hkss, fracs, comps
-
-
-def save_cache(save_paths, results):
-    """Write the HKS cache from load results (list of (save_path, hks, frac, complexity, area))."""
-    kept_paths = [r[0] for r in results]
-    hkss  = [r[1] for r in results]
-    fracs = np.array([r[2] for r in results])
-    comps = np.array([r[3] for r in results])
-    areas = np.array([r[4] for r in results])
-    lengths = np.array([h.shape[0] for h in hkss])
-    hks = np.concatenate(hkss).astype(np.float64) if hkss else np.zeros((0, N_TIMES))
-    os.makedirs(os.path.dirname(CACHE_PATH) or ".", exist_ok=True)
-    np.savez(CACHE_PATH,
-             input_save_paths=np.array(save_paths), kept_save_paths=np.array(kept_paths),
-             hks=hks, lengths=lengths, fracs=fracs, complexities=comps, areas=areas,
-             meta_n_times=N_TIMES, meta_decimate_face=DECIMATE_FACE,
-             meta_datasets=np.array(DATASETS))
-    print(f"  cached {len(kept_paths)} organoids -> {CACHE_PATH} ({hks.nbytes/1e6:.1f} MB)")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -178,32 +134,17 @@ def main():
     save_paths = gather_save_paths()
     print(f"organoids: {len(save_paths)} across {len(DATASETS)} datasets")
 
-    cached = None if args.refresh_cache else _load_from_cache(save_paths)
-    if cached is not None:
-        hkss, fracs, complexities = cached
-        print(f"loaded {len(hkss)} organoids from cache {CACHE_PATH} (no mesh reload)")
-    else:
-        # ---- load per-organoid HKS (reads saved eigvecs; no eigendecomposition) ----
-        if args.refresh_cache:
-            print("--refresh-cache: reloading meshes and rewriting the cache")
-        results = []
-        if args.workers == 1:
-            for p in tqdm(save_paths, desc="load"):
-                r = _run_one(p)
-                if r is not None:
-                    results.append(r)
-        else:
-            tpw = max(1, 8 // args.workers)
-            with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=args.workers, initializer=_init_worker, initargs=(tpw,)) as ex:
-                for r in tqdm(ex.map(_run_one, save_paths), total=len(save_paths), desc="load"):
-                    if r is not None:
-                        results.append(r)
-        save_cache(save_paths, results)          # (re)write cache so the next run is fast
-        hkss         = [r[1] for r in results]
-        fracs        = np.array([r[2] for r in results])
-        complexities = np.array([r[3] for r in results])
-        print(f"loaded {len(hkss)} organoids (mesh reload; cache written)")
+    # read the HKS cache; (re)build it via utils.build_hks_cache on miss/stale/refresh
+    cached = None if args.refresh_cache else utils.load_hks_cache(
+        CACHE_PATH, save_paths, N_TIMES, DECIMATE_FACE)
+    if cached is None:
+        why = "--refresh-cache" if args.refresh_cache else "cache missing/stale"
+        print(f"building HKS cache ({why}) — reloads meshes once")
+        utils.build_hks_cache(CACHE_PATH, save_paths, _run_one, N_TIMES, DECIMATE_FACE,
+                              DATASETS, args.workers)
+        cached = utils.load_hks_cache(CACHE_PATH, save_paths, N_TIMES, DECIMATE_FACE)
+    hkss, fracs, complexities = cached
+    print(f"loaded {len(hkss)} organoids from HKS cache {CACHE_PATH}")
 
     # ---- 95th-pct recon-quality filter ----
     recon_mask = fracs < np.percentile(fracs, RECON_PCTL)

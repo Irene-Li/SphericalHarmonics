@@ -427,3 +427,79 @@ def load_fate_percentages(data_root, ids, datasets,
     ids_found  = ids[found_mask]
     rows       = [cache_pos[u] for u in ids_found]
     return ids_found, cache_P[rows], col_names
+
+
+# ---------------------------------------------------------------------------
+# Per-organoid HKS cache (used by build_vocab.py)
+#
+# Loading a mesh's saved eigendecomposition and computing its decimated per-vertex
+# HKS is the slow step of vocab training. These helpers cache that result (the
+# decimated per-vertex HKS at N_TIMES times + frac/complexity/area) keyed to the
+# current good_labels + N_TIMES/DECIMATE_FACE, so re-running vocab experiments
+# (different CURV_Z, KMeans k, ...) reads one ~60 MB npz instead of re-reading
+# every mesh. build_vocab supplies the per-mesh loader `run_one` so this module
+# stays free of the mesh/FateMarkers dependency (avoids a circular import).
+# ---------------------------------------------------------------------------
+
+def _hks_cache_worker_init(n_threads):
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = str(n_threads)
+
+
+def load_hks_cache(cache_path, save_paths, n_times, decimate_face):
+    """Return (hkss, fracs, complexities) from the HKS cache if it matches the given
+    good_labels (`save_paths`) and params, else None. Degenerate (empty-HKS)
+    organoids are dropped. `hkss` is a list of (n_decim_verts, n_times) arrays."""
+    if not os.path.exists(cache_path):
+        return None
+    z = np.load(cache_path, allow_pickle=True)
+    if (int(z["meta_n_times"]) != n_times or int(z["meta_decimate_face"]) != decimate_face
+            or not np.array_equal(z["input_save_paths"].astype(str),
+                                  np.asarray(save_paths, dtype=str))):
+        return None
+    hkss = np.split(z["hks"], np.cumsum(z["lengths"])[:-1])
+    fracs, comps = z["fracs"], z["complexities"]
+    keep = np.array([h.shape[0] > 0 for h in hkss])
+    if not keep.all():
+        hkss = [h for h, k in zip(hkss, keep) if k]
+        fracs, comps = fracs[keep], comps[keep]
+    return hkss, fracs, comps
+
+
+def build_hks_cache(cache_path, save_paths, run_one, n_times, decimate_face, datasets, workers=6):
+    """Create/update the per-organoid HKS cache at `cache_path`.
+
+    Runs `run_one(save_path)` — which returns (save_path, hks, frac, complexity,
+    area) or None for a failed/degenerate mesh — over `save_paths` in parallel and
+    saves the decimated per-vertex HKS + scalars. `run_one` is passed in by the
+    caller (build_vocab._run_one) so this stays independent of the mesh loader."""
+    import concurrent.futures
+    from tqdm import tqdm
+    res = [None] * len(save_paths)
+    if workers == 1:
+        for i, p in enumerate(tqdm(save_paths, desc="hks cache")):
+            res[i] = run_one(p)
+    else:
+        tpw = max(1, 8 // workers)
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers, initializer=_hks_cache_worker_init, initargs=(tpw,)) as ex:
+            for i, r in enumerate(tqdm(ex.map(run_one, save_paths),
+                                       total=len(save_paths), desc="hks cache")):
+                res[i] = r
+
+    results = [r for r in res if r is not None]
+    kept_paths = [r[0] for r in results]
+    hkss  = [r[1] for r in results]
+    fracs = np.array([r[2] for r in results])
+    comps = np.array([r[3] for r in results])
+    areas = np.array([r[4] for r in results])
+    lengths = np.array([h.shape[0] for h in hkss])
+    hks = np.concatenate(hkss).astype(np.float64) if hkss else np.zeros((0, n_times))
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    np.savez(cache_path,
+             input_save_paths=np.array(save_paths), kept_save_paths=np.array(kept_paths),
+             hks=hks, lengths=lengths, fracs=fracs, complexities=comps, areas=areas,
+             meta_n_times=n_times, meta_decimate_face=decimate_face,
+             meta_datasets=np.array(datasets))
+    print(f"  HKS cache: {len(kept_paths)}/{len(save_paths)} organoids -> {cache_path} "
+          f"({hks.nbytes / 1e6:.1f} MB)")
