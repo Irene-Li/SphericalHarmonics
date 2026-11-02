@@ -1,15 +1,20 @@
-import os
+import concurrent.futures
+import csv
 import glob
 import json
+import os
+
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from matplotlib import pyplot as plt
-import vtk
+import pandas as pd
+import scipy.sparse as sp
+from matplotlib.lines import Line2D
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial.distance import cdist, pdist
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Dimensionality-reduction embeddings: save / load
+# Dimensionality-reduction embeddings: save / load / orient / panel style
 # ---------------------------------------------------------------------------
 
 def save_embedding(out_dir, name, xy, ids, method, **point_fields):
@@ -54,44 +59,101 @@ def load_embedding(path):
     return out
 
 
+def orient_embedding(xy, up):
+    """Rotate a 2D embedding about its centroid so the per-point score `up` increases
+    straight upwards (+y), giving every embedding the same canonical orientation.
+
+    The direction is the least-squares gradient of `up` over the layout, e.g.
+    up = -l_cross puts the low-complexity organoids on top. A pure rotation, so all
+    distances (and the layout itself) are unchanged; returns xy unchanged when `up`
+    has no gradient.
+    """
+    xy = np.asarray(xy, float)
+    c = xy.mean(0)
+    g = np.linalg.lstsq(xy - c, np.asarray(up, float) - np.mean(up), rcond=None)[0]
+    if not np.linalg.norm(g):
+        return xy
+    a = np.pi / 2 - np.arctan2(g[1], g[0])
+    rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    return (xy - c) @ rot.T + c
+
+
+def rotate_to_top(xy, mask):
+    """Rotate a 2D embedding about its centroid so the points in `mask` sit straight above
+    it (+y), e.g. mask = the lowest-complexity organoids puts the spherical branch on top.
+    A pure rotation, so all distances (and the layout itself) are unchanged."""
+    xy = np.asarray(xy, float)
+    c = xy.mean(0)
+    g = xy[mask].mean(0) - c
+    a = np.pi / 2 - np.arctan2(g[1], g[0])
+    rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    return (xy - c) @ rot.T + c
+
+
+def style_embedding_ax(ax, box_aspect=0.8):
+    """Same panel shape for every embedding plot: the axes box is height/width =
+    box_aspect (0.8 = a bit wider than square) and the data aspect is equal, so the
+    layout is undistorted and the data limits absorb the slack."""
+    ax.set_box_aspect(box_aspect)
+    ax.set_aspect('equal', adjustable='datalim')
+
+
+def panel_colorbar(fig, mappable, ax, **kwargs):
+    """Colorbar exactly as tall as its panel: drawn in an inset just right of the axes box,
+    so it follows the panel's fixed box aspect (fig.colorbar(ax=...) instead takes the
+    full grid-cell height and ends up taller than a style_embedding_ax panel)."""
+    return fig.colorbar(mappable, cax=ax.inset_axes([1.03, 0, 0.04, 1]), **kwargs)
+
+
+# enrichment condition per organoid, coloured as in the paper's morphospace figure
+ENRICHMENT_COLOURS = {'timecourse': '#dddddd', 'ctrl': '#97e258', 'stem': '#fdb549',
+                      'abs': '#fb452f', 'TA': '#4d4d4d', 'secretory': '#49c0d7'}
+
+
+def enrichment_condition(datasets, conditions):
+    """Organoid -> enrichment condition: main_dataset = 'timecourse', sup_dataset = 'ctrl'
+    (the WT day-4.5 organoids), pert2 by drug prefix: stem-* = 'stem', abs-* = 'abs',
+    ta-* = 'TA', sec-* = 'secretory'. Anything else keeps its condition name."""
+    by_prefix = {'stem': 'stem', 'abs': 'abs', 'ta': 'TA', 'sec': 'secretory'}
+    out = []
+    for d, c in zip(np.asarray(datasets).astype(str), np.asarray(conditions).astype(str)):
+        if d == 'main_dataset':
+            out.append('timecourse')
+        elif d == 'sup_dataset':
+            out.append('ctrl')
+        else:
+            out.append(by_prefix.get(c.split('-')[0].lower(), c))
+    return np.array(out)
+
+
+def scatter_enrichment(ax, xy, cats, s=10, seed=0):
+    """Scatter coloured by enrichment condition: 'timecourse' in light grey underneath, the
+    other conditions on top in a seeded random order (so no condition hides another).
+    Returns legend handles in ENRICHMENT_COLOURS order (plus any unknown condition, grey)."""
+    cats = np.asarray(cats)
+    colour = lambda c: ENRICHMENT_COLOURS.get(c, '#9e9e9e')
+    under = cats == 'timecourse'
+    ax.scatter(*np.asarray(xy)[under].T, s=s, color=colour('timecourse'), linewidths=0, zorder=1)
+    top = np.random.default_rng(seed).permutation(np.where(~under)[0])
+    ax.scatter(*np.asarray(xy)[top].T, s=s, c=[colour(c) for c in cats[top]], linewidths=0, zorder=2)
+    present = [c for c in ENRICHMENT_COLOURS if c in set(cats)] + \
+              sorted(set(cats) - set(ENRICHMENT_COLOURS))
+    return [Line2D([], [], ls='none', marker='o', markersize=8, markeredgewidth=0,
+                   markerfacecolor=colour(c), label=c) for c in present]
+
+
 # ---------------------------------------------------------------------------
-# Organoid id -> on-disk mesh paths
+# Organoid id -> saved mesh and coefficient paths
 # ---------------------------------------------------------------------------
-
-def _parse_uid(uid):
-    """'day3p5_A01_42' -> (timepoint, well, label)."""
-    timepoint, well, label = uid.split("_")
-    return timepoint, well, label
-
-
-def _well_dir(uid, cfg):
-    """Common '{tp}/{zarr}/{well[0]}/{well[1:]}/{round}' fragment for a uid."""
-    timepoint, well, label = _parse_uid(uid)
-    zarr_name = cfg["zarr_names"][timepoint]
-    round_name = cfg["rounds"][timepoint]
-    return f"{timepoint}/{zarr_name}/{well[0]}/{well[1:]}/{round_name}", label
-
-
-def organoid_vtp_path(data_path, cfg, uid):
-    """Path to the original .vtp mesh (carries per-vertex fate fields)."""
-    frag, label = _well_dir(uid, cfg)
-    mesh_name = cfg["mesh_name"]
-    return f"{data_path}/fractal_output/{frag}/meshes/{mesh_name}/{label}.vtp"
-
-
-def vtp_flat_path(data_path, cfg, label_uid):
-    """Mesh path for the 'vtp_flat' layout: {data}/{vtp_dir}/{timepoint}/{label_uid}.vtp."""
-    timepoint = label_uid.split("_")[0]
-    return f"{data_path}/{cfg.get('vtp_dir', 'vtp')}/{timepoint}/{label_uid}.vtp"
-
 
 def _vtp_flat_fm_path(data_path, cfg, label_uid, suffix):
     """Locate an fm_data file for a vtp_flat organoid.
 
     Fast path: the first uid token is the timepoint subfolder (main/sup:
     'day4p5_A06_11' -> vtp/day4p5/...). Fallback: the timepoint folder is NOT
-    encoded in the uid (pert/pert2: folders are 'normal'/'small' but the uid
-    leads with the drug token, e.g. 'sec-DaptHi_day4p5_F02_47'), so search the
+    encoded in the uid (pert2: folders are 'normal'/'small' but the uid leads with
+    the drug token, e.g. 'sec-DaptHi_day4p5_F02_47'; wnt_pert: folders are the
+    conditions, e.g. 'IWP2_60hr_HiWnt_day3p5_C07_1'), so search the
     configured timepoints, else glob the vtp subfolders. Returns the fast-path
     candidate if nothing is found (caller handles the missing file)."""
     vtp_dir = cfg.get("vtp_dir", "vtp")
@@ -119,42 +181,10 @@ def vtp_flat_coeffs_path(data_path, cfg, label_uid):
     return _vtp_flat_fm_path(data_path, cfg, label_uid, "_coeffs.npz")
 
 
-def organoid_obj_path(data_path, cfg, uid):
-    """Path to the saved PCA-transformed shape (.obj, geometry only)."""
-    frag, label = _well_dir(uid, cfg)
-    return f"{data_path}/fractal_output/{frag}/fm_data/{label}_transformed_mesh.obj"
 
-
-def organoid_coeffs_path(data_path, cfg, uid):
-    """Path to the saved per-organoid coefficients/eigendecomposition npz."""
-    frag, label = _well_dir(uid, cfg)
-    return f"{data_path}/fractal_output/{frag}/fm_data/{label}_coeffs.npz"
-
-def read_stl(filename): 
-    reader = vtk.vtkSTLReader()
-    reader.SetFileName(filename)
-    reader.Update()
-    polydata = reader.GetOutput()
-
-    v = np.array(polydata.GetPoints().GetData())
-
-    # Extract faces (cells)
-    cells = polydata.GetPolys()
-    cells.InitTraversal()
-
-    # Create an array to store the faces
-    n_faces = polydata.GetNumberOfPolys()
-    faces = np.zeros((n_faces, 3), dtype=np.int64)
-
-    # Extract all faces
-    for i in range(n_faces):
-        cell = vtk.vtkIdList()
-        cells.GetNextCell(cell)
-        for j in range(3):  # Assuming triangular faces
-            faces[i, j] = cell.GetId(j)
-    f = faces 
-    return v, f 
-
+# ---------------------------------------------------------------------------
+# Spherical coordinates
+# ---------------------------------------------------------------------------
 
 def sph2cart(r, theta, phi):
     x = r * np.sin(theta) * np.cos(phi)
@@ -173,181 +203,41 @@ def sph2latlon(theta, phi):
     lon = phi*180/np.pi
     return lat, lon
 
-def latlon2sph(lat, lon):
-    theta = np.pi/2 - lat*np.pi/180
-    phi = lon*np.pi/180
-    return theta, phi
-
-
-def draw_2d_surface(r, theta_grid, phi_grid):
-    plt.tricontourf(phi_grid.flatten(), theta_grid.flatten(), r.flatten(), 100)
-    plt.gca().invert_yaxis()
-    plt.xlabel(r'$\phi$')
-    plt.ylabel(r'$\theta$')
-    plt.colorbar()
-    plt.show()  
-
-
-def draw_2d_scatter(r, theta_grid, phi_grid, title='r'):
-    plt.scatter(phi_grid.flatten(), theta_grid.flatten(), c=r.flatten(),
-                s=2, cmap='viridis', alpha=0.6)
-    plt.gca().invert_yaxis()
-    plt.xlabel(r'$\phi$')
-    plt.ylabel(r'$\theta$')
-    plt.title(title)
-    plt.colorbar()
-    plt.show()  
-
-
-
-
-def draw_3d_surface(x, y, z, r):
-    fig = go.Figure(data=[
-            go.Surface(
-                x=x, y=y, z=z,
-                surfacecolor=r,
-                colorscale='Viridis',
-                opacity=1,
-                showscale=True,
-            )
-        ])
-
-    fig.update_layout(
-            scene={
-                'xaxis_title': 'X',
-                'yaxis_title': 'Y',
-                'zaxis_title': 'Z',
-                'aspectmode': 'data',
-            },
-            width=800,
-            height=800,
-            margin=dict(l=0, r=0, b=0, t=40)
-        )
-    return fig 
-
-
-def plot_3d_scatter(x, y, z, r):
-    fig = go.Figure(data=[go.Scatter3d(
-        x=x.flatten(),
-        y=y.flatten(),
-        z=z.flatten(),
-        mode='markers',
-        marker=dict(
-            size=2,
-            color=r.flatten(),  # color points by z-value
-            colorscale='Viridis',
-            opacity=0.8
-        )
-    )])
-
-    # Update layout
-    fig.update_layout(
-        title='3D Scatter Plot',
-        scene=dict(
-            xaxis_title='X',
-            yaxis_title='Y',
-            zaxis_title='Z',
-            aspectmode='data'  # maintain aspect ratio
-        ),
-        width=800,
-        height=800
-    )
-
-    return fig
-
 
 # ---------------------------------------------------------------------------
-# HKS shape features  (shared by optimize_hks_weights.py and dim_red.ipynb)
+# HKS shape features  (used by dim_red.ipynb)
 # ---------------------------------------------------------------------------
 
-UID_GROUPS_FILE = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "Data", "uid_groups.json")
-)
+def load_hks_features(master_path, mode_cut=8, amplitude_weight=1.2, keep_ids=None):
+    """Shape features: the HKS bag-of-features SPHARM spectrum plus one HKS-amplitude column.
 
-
-def load_uid_groups(path=UID_GROUPS_FILE):
-    """Load hand-picked organoid groups from JSON as list[list[str]]."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"uid groups json not found: {path}. Expected a list of UID groups."
-        )
-    with open(path) as f:
-        data = json.load(f)
-
-    if not isinstance(data, list) or not all(isinstance(g, list) for g in data):
-        raise ValueError(
-            f"Invalid UID groups format in {path}. Expected list[list[str]]."
-        )
-    for gi, grp in enumerate(data):
-        if not all(isinstance(uid, str) for uid in grp):
-            raise ValueError(
-                f"Invalid UID type in group {gi} in {path}. Expected strings only."
-            )
-    return data
-
-
-# Hand-picked organoid groups = distinct shape categories. Used as supervision
-# when learning HKS weights (within-group close, between-group far) and as an
-# overlay when visualising embeddings. Source of truth: Data/uid_groups.json
-UID_GROUPS = load_uid_groups()
-
-
-def load_power_spectrum(master_path, mode_cut=8,
-                        vocab_key="hks_bof_coeffs__kmeans_variable"):
-    """HKS bag-of-features coeffs -> normalized power spectrum (N, mode_cut, n_vocab).
-
-    Per degree l, sums the squared coefficients in the l-shell, then divides each
-    vocab channel by its max across samples and modes. `mode_cut` keeps only the
-    first that-many modes (degrees); higher modes capture fine surface detail and
-    are dominated by small imperfections, so dropping them denoises the shape.
-    Pass mode_cut=None to keep all modes. Returns (ids, hps).
+    Returns (ids, features) with features (N, mode_cut * n_vocab [+ 1]). The stored power per
+    degree of each vocab channel (compute_master_npz.compute_bof_power) becomes sqrt(power), the
+    RMS amplitude of that degree, and each (degree, channel) is standardised, so every degree has
+    an equal say in the distance (raw power leaves ~90% of it to degrees 0 and 2). With
+    amplitude_weight > 0 one column is appended: log(hks_amplitude) z-scored, scaled so its mean
+    pairwise |difference| equals the mean pairwise distance of the spectrum block, times
+    amplitude_weight. The amplitude restores how strongly the HKS varies over the surface, which
+    the vocab encoding normalises away. `keep_ids` restricts the file to those organoids, in that
+    order, before anything is computed, so the scaling comes from them alone.
     """
     m = np.load(master_path, allow_pickle=True)
     ids = m["ids"].astype(str)
-    bof = m[vocab_key]                                  # (N, n_modes^2, n_vocab)
-    nd = int(np.sqrt(bof.shape[1]))
-    hps = np.zeros((bof.shape[0], nd, bof.shape[2]))
-    for n in range(nd):
-        hps[:, n, :] = np.sum(bof[:, n ** 2:(n + 1) ** 2, :] ** 2, axis=1)
-    if mode_cut is not None:
-        hps = hps[:, :mode_cut, :]
-    hps /= np.max(hps, axis=(0, 1), keepdims=True)
-    return ids, hps
-
-
-def apply_hks_weights(hps, weights):
-    """Weight an (N, M, V) power spectrum by a (M, V) matrix and flatten to (N, M*V).
-
-    Euclidean distance in the returned feature space is the weighted HKS shape
-    distance used for clustering / dimensionality reduction.
-    """
-    w = np.asarray(weights)
-    assert w.shape == hps.shape[1:], \
-        f"weights {w.shape} != power-spectrum modes×vocab {hps.shape[1:]}"
-    return (hps * w[np.newaxis, :, :]).reshape(hps.shape[0], -1)
-
-
-def group_pair_indices(uid_groups, id_to_row):
-    """Resolve hand-picked groups to row indices -> within/between pair arrays.
-
-    Returns (within_i, within_j, between_i, between_j). Ids missing from
-    `id_to_row` are skipped; ids repeated inside a group are de-duped so no
-    zero-distance self-pair is created.
-    """
-    from itertools import combinations
-    grp_rows = [list(dict.fromkeys(id_to_row[u] for u in g if u in id_to_row))
-                for g in uid_groups]
-    wi, wj = [], []
-    for rr in grp_rows:
-        for a, b in combinations(rr, 2):
-            wi.append(a); wj.append(b)
-    oi, oj = [], []
-    for p in range(len(grp_rows)):
-        for q in range(p + 1, len(grp_rows)):
-            for a in grp_rows[p]:
-                for b in grp_rows[q]:
-                    oi.append(a); oj.append(b)
-    return np.array(wi), np.array(wj), np.array(oi), np.array(oj)
+    power = np.array(m["hks_bof_power__kmeans_variable"], dtype=float)  # (N, n_degrees, n_vocab)
+    if mode_cut > power.shape[1]:
+        raise ValueError(f"{master_path} has only {power.shape[1]} degrees "
+                         f"(mode_cut={mode_cut}; see compute_master_npz.HKS_LMAX)")
+    row = {u: i for i, u in enumerate(ids)}
+    rows = np.arange(len(ids)) if keep_ids is None else np.array([row[u] for u in keep_ids])
+    ids = ids[rows]
+    amps = np.sqrt(power[rows, :mode_cut])
+    H = ((amps - amps.mean(axis=0, keepdims=True)) / amps.std(axis=0, keepdims=True)).reshape(len(ids), -1)
+    if not amplitude_weight:
+        return ids, H
+    z = np.log(m["hks_amplitude"])[rows]
+    z = (z - z.mean()) / z.std()
+    scale = pdist(H).mean() / pdist(z[:, None]).mean()
+    return ids, np.hstack([H, amplitude_weight * scale * z[:, None]])
 
 
 def _fate_from_csv(data_root, datasets, csv_name):
@@ -356,7 +246,6 @@ def _fate_from_csv(data_root, datasets, csv_name):
     Iterates every row in the CSV and only stores organoids actually found
     (no zero-fill for missing ids). Returns (found_ids, P, col_names).
     """
-    import pandas as pd
     perc_dfs = {}
     for ds in sorted(set(datasets)):
         path = os.path.join(data_root, ds, csv_name)
@@ -410,17 +299,16 @@ def load_fate_percentages(data_root, ids, datasets,
             os.path.getmtime(cache_path) >= max(os.path.getmtime(p) for p in csv_paths))
         if fresh:
             z = np.load(cache_path, allow_pickle=True)
-            if "found_only" in z:               # new-format cache (found ids only)
-                cache_ids = z["ids"].astype(str)
-                cache_P   = z["percentages"]
-                col_names = list(z["col_names"])
+            cache_ids = z["ids"].astype(str)
+            cache_P   = z["percentages"]
+            col_names = list(z["col_names"])
 
-    if cache_ids is None:                       # cold start or stale/old-format cache
+    if cache_ids is None:                       # cold start or stale cache
         cache_ids, cache_P, col_names = _fate_from_csv(data_root, datasets, csv_name)
         if cache_path:
             os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
             np.savez(cache_path, ids=cache_ids, percentages=cache_P,
-                     col_names=np.array(col_names), found_only=np.array([True]))
+                     col_names=np.array(col_names))
 
     cache_pos = {u: i for i, u in enumerate(cache_ids)}
     found_mask = np.array([u in cache_pos for u in ids])
@@ -473,8 +361,6 @@ def build_hks_cache(cache_path, save_paths, run_one, n_times, decimate_face, dat
     area) or None for a failed/degenerate mesh — over `save_paths` in parallel and
     saves the decimated per-vertex HKS + scalars. `run_one` is passed in by the
     caller (build_vocab._run_one) so this stays independent of the mesh loader."""
-    import concurrent.futures
-    from tqdm import tqdm
     res = [None] * len(save_paths)
     if workers == 1:
         for i, p in enumerate(tqdm(save_paths, desc="hks cache")):
@@ -503,3 +389,200 @@ def build_hks_cache(cache_path, save_paths, run_one, n_times, decimate_face, dat
              meta_datasets=np.array(datasets))
     print(f"  HKS cache: {len(kept_paths)}/{len(save_paths)} organoids -> {cache_path} "
           f"({hks.nbytes / 1e6:.1f} MB)")
+
+# ---------------------------------------------------------------------------
+# Mesh topology  (manage_discards.py's hole rule)
+#
+# A clean organoid surface is one closed, genus-0 sheet. Per mesh the table
+# {dataset}/feature_tables/mesh_topology.csv records:
+#   n_components         connected pieces of the surface
+#   n_boundary_edges     edges with only one adjacent face (open surface)
+#   n_boundary_loops     open holes = connected loops of boundary edges
+#   n_nonmanifold_edges  edges shared by > 2 faces (self-intersecting / fin-like surface)
+#   n_pinch_vertices     extra fans at vertices where the surface touches itself at a
+#                        point (split before computing the genus; not a hole)
+#   euler                V - E + F (referenced vertices only)
+#   genus                handles / tunnels through the surface: (2C - euler' - B) / 2 with
+#                        euler' after splitting pinch vertices (NaN when an edge is
+#                        non-manifold, where the genus is ill-defined)
+#   has_hole             1 if n_boundary_loops > 0 or genus > 0 (or genus undefined)
+# A deep dead-end pit is NOT a topological hole (the surface stays closed, genus 0);
+# compute_master_npz's hks_max_ratio flags the narrow pits that matter.
+# ---------------------------------------------------------------------------
+
+TOPOLOGY_FIELDS = ["label_uid", "n_vertices", "n_faces", "n_components", "n_boundary_edges",
+                   "n_boundary_loops", "n_nonmanifold_edges", "n_pinch_vertices", "euler",
+                   "genus", "has_hole"]
+
+
+def mesh_topology(f):
+    """Topology summary of a triangle mesh given its (F, 3) face array.
+
+    Pinch vertices (the surface touching itself at a single point) are split
+    before the genus is computed — they are not holes. Each face corner is a
+    node; corners of the same vertex are joined across every edge shared by
+    exactly two faces, so the connected groups are the vertex's fans."""
+    used = np.unique(f)
+    nv = len(used)
+    remap = np.full(f.max() + 1, -1)
+    remap[used] = np.arange(nv)
+    f = remap[f]
+    nf = len(f)
+
+    # half-edges (face, corner a, corner b) keyed by their undirected edge
+    he_face = np.repeat(np.arange(nf), 3)
+    ka, kb = np.tile([0, 1, 2], nf), np.tile([1, 2, 0], nf)
+    va, vb = f[he_face, ka], f[he_face, kb]
+    key = np.sort(np.stack([va, vb], 1), 1)
+    order = np.lexsort((key[:, 1], key[:, 0]))
+    key_s = key[order]
+    edges, start, count = np.unique(key_s, axis=0, return_index=True, return_counts=True)
+    n_edges = len(edges)
+    bnd = edges[count == 1]
+    n_nonmanifold = int((count > 2).sum())
+
+    # manifold edges: join the two faces, and the matching corners at both endpoints
+    two = start[count == 2]
+    h1, h2 = order[two], order[two + 1]
+    def corner(h, v):
+        return 3 * he_face[h] + np.where(va[h] == v, ka[h], kb[h])
+    lo, hi = key_s[two, 0], key_s[two, 1]
+    rows = np.concatenate([corner(h1, lo), corner(h1, hi)])
+    cols = np.concatenate([corner(h2, lo), corner(h2, hi)])
+    n_fans = connected_components(sp.coo_matrix((np.ones(len(rows)), (rows, cols)),
+                                                shape=(3 * nf, 3 * nf)), directed=False)[0]
+    n_comp = connected_components(sp.coo_matrix((np.ones(len(two)), (he_face[h1], he_face[h2])),
+                                                shape=(nf, nf)), directed=False)[0]
+
+    # boundary loops = connected components of the boundary-edge graph
+    if len(bnd):
+        bv, inv = np.unique(bnd, return_inverse=True)
+        inv = inv.reshape(-1, 2)
+        badj = sp.coo_matrix((np.ones(len(inv)), (inv[:, 0], inv[:, 1])), shape=(len(bv), len(bv)))
+        n_loops = connected_components(badj, directed=False)[0]
+    else:
+        n_loops = 0
+
+    euler = nv - n_edges + nf
+    euler_split = n_fans - n_edges + nf          # after splitting pinch vertices
+    genus = np.nan if n_nonmanifold else (2 * n_comp - euler_split - n_loops) / 2
+    has_hole = int(n_loops > 0 or not np.isfinite(genus) or genus > 0)
+    return dict(n_vertices=nv, n_faces=nf, n_components=int(n_comp),
+                n_boundary_edges=len(bnd), n_boundary_loops=int(n_loops),
+                n_nonmanifold_edges=n_nonmanifold, n_pinch_vertices=int(n_fans - nv),
+                euler=int(euler), genus=genus, has_hole=has_hole)
+
+
+def _mesh_topology_row(path):
+    """One row of the topology table, the mesh read exactly as the pipeline reads it
+    (FateMarkers.load_mesh_from_file: .vtp / .stl / .obj with the same point merging)."""
+    from src.fatemarkers import FateMarkers         # here: vtk is heavy, and only this needs it
+    uid = os.path.splitext(os.path.basename(path))[0]
+    try:
+        m = FateMarkers()
+        m.load_mesh_from_file(path)
+        return dict(label_uid=uid, **mesh_topology(np.asarray(m.f, dtype=np.int64)))
+    except Exception as e:
+        print(f"\n  [skip] {uid}: {e}")
+        return None
+
+
+def update_mesh_topology(data_path, workers=1, refresh=False, verbose=True):
+    """Bring {data_path}/feature_tables/mesh_topology.csv up to date: compute every mesh of the
+    (vtp_flat) dataset that is not in it yet, or all of them with refresh. Returns its path.
+    manage_discards.py calls this before reading the table."""
+    data_path = data_path.rstrip("/")
+    with open(f"{data_path}/config.json") as fh:
+        cfg = json.load(fh)
+    if cfg.get("layout") != "vtp_flat":
+        raise SystemExit("mesh topology supports the vtp_flat layout only")
+    out = f"{data_path}/feature_tables/mesh_topology.csv"
+
+    rows = {}
+    if os.path.exists(out) and not refresh:
+        with open(out) as fh:
+            rows = {r["label_uid"]: r for r in csv.DictReader(fh)}
+    ext, vtp_dir = cfg.get("mesh_ext", "vtp"), cfg.get("vtp_dir", "vtp")
+    paths = sorted(p for tp in cfg["timepoints"]
+                   for p in glob.glob(os.path.join(data_path, vtp_dir, tp, f"*.{ext}")))
+    todo = [p for p in paths if os.path.splitext(os.path.basename(p))[0] not in rows]
+    if verbose or todo:
+        print(f"{len(rows)} meshes already in {out} | {len(todo)} to compute")
+    if not todo and rows:
+        return out
+
+    if workers == 1:
+        results = [_mesh_topology_row(p) for p in tqdm(todo)]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+            results = list(tqdm(ex.map(_mesh_topology_row, todo, chunksize=8), total=len(todo)))
+    rows.update({r["label_uid"]: r for r in results if r is not None})
+
+    with open(out, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=TOPOLOGY_FIELDS)
+        w.writeheader()
+        w.writerows(rows[u] for u in sorted(rows))
+
+    holes = [r for r in rows.values() if int(r["has_hole"])]
+    def n(key): return sum(1 for r in rows.values() if float(r[key]) > 0)
+    print(f"wrote {out}: {len(rows)} meshes | {len(holes)} with holes "
+          f"(open: {n('n_boundary_loops')}, non-manifold: {n('n_nonmanifold_edges')}, "
+          f"handles: {sum(1 for r in rows.values() if str(r['genus']) not in ('nan', '') and float(r['genus']) > 0)}) "
+          f"| multi-piece: {sum(1 for r in rows.values() if int(r['n_components']) > 1)}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cluster representatives  (dim_red.ipynb's highlight figure)
+# ---------------------------------------------------------------------------
+
+def update_highlight_json(path, ids, features, clusters, runners_up=2):
+    """Pick one representative organoid per aggregated shape cluster: the cluster MEDOID, the
+    member with the smallest mean feature distance to the other members (the organoid most
+    similar to the rest of its cluster). The low-complexity group 0 is skipped (the
+    figure's 'spherical' row already illustrates it).
+
+    ids, features, clusters are row-aligned (dim_red's m_ids, shape_features and
+    aggregated_shape_clusters). Prints, per cluster, the medoid, the runners-up and where the
+    json's current pick ranks, then replaces the json's 'highlight' list with the medoids, carrying
+    over each cluster's 'name'; 'spherical' and any other keys are kept. Returns the picks."""
+    ids = np.asarray(ids).astype(str)
+    F = np.asarray(features, float)
+    agg = np.asarray(clusters).astype(int)
+    doc = json.load(open(path)) if os.path.exists(path) else {}
+    pos = {u: i for i, u in enumerate(ids)}
+    current = {}                                   # cluster -> the json's current entry for it
+    for h in doc.get("highlight", []):
+        if h["uid"] in pos:
+            current.setdefault(int(agg[pos[h["uid"]]]), h)
+
+    picks = []
+    for c in sorted(set(agg.tolist())):
+        if c == 0:
+            continue
+        idx = np.where(agg == c)[0]
+        n = len(idx)
+        if n < 2:
+            print(f"cluster {c}: only {n} member — skipped")
+            continue
+        D = cdist(F[idx], F[idx])
+        mean_d = D.sum(1) / (n - 1)                # mean distance to the OTHER members
+        order = np.argsort(mean_d, kind="stable")
+        print(f"cluster {c} (n={n}, mean distance between members {D.sum() / (n * (n - 1)):.3f})")
+        for r, k in enumerate(order[:1 + runners_up]):
+            print(f"  {'medoid' if r == 0 else f'#{r + 1}':>6s}  {ids[idx[k]]:45s} mean distance {mean_d[k]:.3f}")
+        old = current.get(c)
+        if old is not None:
+            k_old = int(np.where(idx[order] == pos[old["uid"]])[0][0])
+            print(f"  {'was':>6s}  {old['uid']:45s} mean distance {mean_d[order[k_old]]:.3f}"
+                  f"  (rank {k_old + 1}/{n})")
+        picks.append({"uid": str(ids[idx[order[0]]]),
+                      "note": f"agg_cluster {c} medoid: smallest mean feature distance to the other "
+                              f"{n - 1} members ({mean_d[order[0]]:.3f}; cluster average "
+                              f"{D.sum() / (n * (n - 1)):.3f})",
+                      "name": (old or {}).get("name", "")})
+    doc["highlight"] = picks
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False)
+    print(f"wrote {len(picks)} representatives to {path}")
+    return picks

@@ -18,10 +18,7 @@ dependencies:
   - scipy
   - scikit-learn
   - matplotlib
-  - plotly        # imported by src/utils.py at load time
-  - pyshtools     # imported by src/meshharm.py at load time
-  - vtk           # reads the .vtp mesh files
+  - pyshtools     # SPHARM expansions (src/spharm.py)
+  - vtk           # reads the .vtp mesh files + renders the 3D organoid panel
   - igl           # libigl: mesh I/O + geometry (import name: igl)
-  - pip
-  - pip:
-      - polyscope  # the interactive 3D mesh window
+  - pyqt          # PyQt5: the viewer window

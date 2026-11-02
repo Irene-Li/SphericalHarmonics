@@ -1,27 +1,34 @@
 import igl
 import numpy as np
-import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
-from scipy.sparse import diags
-from src.meshharm import MeshHarm
-from src import utils 
-import vtk 
+import vtk
 from sklearn.decomposition import PCA
 
-class FateMarkers(): 
+
+def _polydata_mesh(polydata):
+    """(vertices, faces) of a triangulated vtkPolyData."""
+    v = np.array(polydata.GetPoints().GetData())
+    cells = polydata.GetPolys()
+    cells.InitTraversal()
+    f = np.zeros((polydata.GetNumberOfPolys(), 3), dtype=np.int64)
+    cell = vtk.vtkIdList()
+    for i in range(len(f)):
+        cells.GetNextCell(cell)
+        for j in range(3):
+            f[i, j] = cell.GetId(j)
+    return v, f
+
+
+class FateMarkers:
+    """A true-geometry organoid mesh with its per-vertex fate fields, Laplace-Beltrami
+    eigendecomposition and HKS."""
 
     def __init__(self):
-        """Initialize the SpHarm with empty attributes."""
         self.v = None  # Vertices
         self.f = None  # Faces
 
     def align_with_pca(self):
-        """
-        Align the mesh using PCA.
-        
-        Returns:
-            self: For method chaining
-        """
+        """Rotate the mesh onto its principal axes, with their signs fixed."""
         pca = PCA(n_components=3)
         pca.fit(self.v)
         self.v = pca.transform(self.v)
@@ -57,79 +64,66 @@ class FateMarkers():
         return self
 
     def load_mesh_from_file(self, path):
-        """
-        Load a mesh from a file (STL or OBJ).
-        
-        Args:
-            path: Path to the mesh file
-            
-        Returns:
-            self: For method chaining
-        """
+        """Load a .obj, .vtp or .stl mesh, centred and in units of 10 mesh units (about a cell)."""
         if path.endswith('.obj'):
             self.v, self.f = igl.read_triangle_mesh(path)
         elif path.endswith('.vtp'):
-            self._load_vtp(path) 
+            self._load_vtp(path)
+        elif path.endswith('.stl'):
+            self._load_stl(path)
         else:
             raise ValueError(f"Unsupported file format: {path}")
         
-        self._rescale_v()  # Center and normalize the vertices
-            
+        self._rescale_v()
         return self
-    
-    def precompute_eigens(self, lmax=15, sigma=0):
-        self.lmax = lmax 
-        k = int(lmax**2)
 
-        # compute the harmonics modes 
-        normalised_v = self.v/np.max(np.abs(self.v), axis=0)[np.newaxis, :] # important to normalise to ensure proper ordering of the harmonics 
-        _, self.modes, self.mass_matrix = self._eig_decomp(normalised_v, self.f, k=k, sigma=sigma)
+    def precompute_eigens(self, lmax=15, hks=True):
+        """True-geometry Laplace-Beltrami eigendecomposition (lmax**2 pairs), which the
+        HKS is built from, and the true surface area. hks=False (complexity-only) skips
+        the eigensolve. The harmonic decomposition of fields and shape is SPHARM on the
+        spherical map (src.spharm, compute_master_npz), not these eigenvectors."""
+        self.lmax = lmax
+        mass = igl.massmatrix(self.v, self.f, igl.MASSMATRIX_TYPE_VORONOI)
+        self.eigvals = self.eigvecs = None
+        if hks:
+            L = -igl.cotmatrix(self.v, self.f)
+            self.eigvals, self.eigvecs = eigsh(L, k=int(lmax**2), M=mass, sigma=0, which='LM')
+        self.area = mass.diagonal().sum()
 
-        # precompute the true eig decomp for the original mesh 
-        self.eigvals, self.eigvecs, true_area_matrix = self._eig_decomp(self.v, self.f, k=k, sigma=sigma)
-        self.area = true_area_matrix.diagonal().sum()
-
-    def _rescale_v(self): 
-        # Center and normalize
+    def _rescale_v(self):
         self.v -= self.v.mean(0)
-        # self.v /= np.mean(np.linalg.norm(self.v, axis=-1))
-        self.v /= 10 # rescale to the units in length of a cell 
-    
-    def _load_vtp(self, path): 
+        self.v /= 10 # rescale to the units in length of a cell
+
+    def _load_stl(self, path):
+        """Geometry-only mesh (no per-vertex fields). Rejects incomplete files: a
+        truncated/zero-filled ASCII STL can still parse into a partial mesh."""
+        with open(path, 'rb') as fh:
+            head = fh.read(5)
+            fh.seek(max(0, fh.seek(0, 2) - 256))
+            tail = fh.read()
+        if head == b'solid' and b'endsolid' not in tail:
+            raise ValueError(f"incomplete ASCII STL (no 'endsolid'): {path}")
+        reader = vtk.vtkSTLReader()
+        reader.SetFileName(path)
+        reader.Update()
+        v, f = _polydata_mesh(reader.GetOutput())
+        if len(f) == 0:
+            raise ValueError(f"STL has no faces: {path}")
+        # vtkSTLReader gives float32 points; the .vtp meshes load as float64
+        self.v = v.astype(np.float64)
+        self.f = f
+        self.field_names = []
+        self.fields = None
+
+    def _load_vtp(self, path):
         reader = vtk.vtkXMLPolyDataReader()
         reader.SetFileName(path)
         reader.Update()
         polydata = reader.GetOutput()
-
-        # Extract vertices
-        self.v = np.array(polydata.GetPoints().GetData())
-
-        # Extract faces (cells)
-        cells = polydata.GetPolys()
-        cells.InitTraversal()
-
-        # Create an array to store the faces
-        n_faces = polydata.GetNumberOfPolys()
-        faces = np.zeros((n_faces, 3), dtype=np.int64)
-
-        # Extract all faces
-        for i in range(n_faces):
-            cell = vtk.vtkIdList()
-            cells.GetNextCell(cell)
-            for j in range(3):  # Assuming triangular faces
-                faces[i, j] = cell.GetId(j)
-        self.f = faces
-
-        # Get the scalar fields 
-
+        self.v, self.f = _polydata_mesh(polydata)
         point_data = polydata.GetPointData()
-        self.field_names = [] 
-        self.fields = []
-        for i in range(point_data.GetNumberOfArrays()):
-            array = point_data.GetArray(i)
-            self.field_names.append(array.GetName())
-            self.fields.append(np.array(array))
-        self.fields = np.array(self.fields).T  # Transpose to match vertices
+        self.field_names = [point_data.GetArray(i).GetName() for i in range(point_data.GetNumberOfArrays())]
+        self.fields = np.array([np.array(point_data.GetArray(i)) for i in range(point_data.GetNumberOfArrays())]).T
 
     def _refine_markers(self, annotation_names, exclusion_rules):
         """Combine multi-channel markers and apply biological mutual exclusion to
@@ -175,105 +169,35 @@ class FateMarkers():
             self.fields[:, idx[marker]] = np.where(keep, orig[:, idx[marker]], 0)
         return self
 
-
-    def _eig_decomp(self, v, f, k=100, sigma=0): 
-        """
-        Compute the first k eigenvalues and eigenvectors of the Laplace-Beltrami operator.
-        
-        Args:
-            k: Number of eigenvalues/vectors to compute.
-        Returns:
-            eigvals: Eigenvalues
-            eigvecs: Eigenvectors
-        """
-        L = -igl.cotmatrix(v, f)
-        mass_matrix = igl.massmatrix(v, f, igl.MASSMATRIX_TYPE_VORONOI)
-        eigvals, eigvecs = sp.linalg.eigsh(L, k=k, M=mass_matrix, sigma=sigma, which='LM')
-        return eigvals, eigvecs, mass_matrix
-
-    def compute_coefficients(self, fate=True):
-        self.coeffs_v = self.modes.T @ (self.mass_matrix @ self.v)
-        if not fate:
-            return self.coeffs_v
-        self.coeffs_fm = self.modes.T @ (self.mass_matrix @ self.fields)
-        return self.coeffs_v, self.coeffs_fm
-
-    def compute_hks_for_new_times(self, new_ts=[1, 5, 10], coeffs=True):
-        hks = [] 
+    def compute_hks_for_new_times(self, new_ts=[1, 5, 10]):
+        """Per-vertex HKS (n_verts, len(new_ts)) from the true-geometry eigendecomposition."""
+        hks = []
         for t in new_ts:
             hks.append(np.einsum('i, ji->j', np.exp(-self.eigvals*t), self.eigvecs**2))
-        hks = np.array(hks).T 
+        return np.array(hks).T
 
-        if coeffs: 
-            coeffs_hks = self.modes.T @ (self.mass_matrix @ hks)
-            return coeffs_hks
-        else: 
-            return hks 
-
-    def reconstruct_from_coeffs(self, coeffs, lmax=8):
-        '''
-        Reconstruct the shape from harmonics coefficients.
-        Args: 
-            lmax: Maximum degree for the harmonics coefficients.
-        Returns: 
-            v_reconstructed (np.ndarray): Reconstructed vertex coordinates.
-            Shape: (k, 3), where k = lmax**2 and 3 corresponds to the (x, y, z) coordinates of each vertex.
-        '''
-        if self.lmax >= lmax: 
-            recon = self.modes[:, :int(lmax**2)] @ coeffs[:int(lmax**2), :]
-        else: 
-            raise ValueError(f"lmax {self.lmax} is less than the requested lmax {lmax}. Please compute coefficients with lmax >= {lmax} first.")
-        return recon
-    
-    def compute_spectrum(self, coeffs, lmax=8): 
-        spectrum = [] 
-        if lmax <= self.lmax: 
-            for i in range(lmax):
-                spectrum.append(np.sum(coeffs[i**2:(i+1)**2]**2, axis=0))
-        else: 
-            raise ValueError(f"lmax {self.lmax} is less than the requested lmax {lmax}. Please compute coefficients with lmax >= {lmax} first.")
-        return np.array(spectrum)
-    
-    def compute_recon_quality(self, lmax=None): 
-        if lmax is None:
-            lmax = self.lmax
-        v_recon = self.reconstruct_from_coeffs(self.coeffs_v, lmax=lmax)
-        diff = self.v - v_recon 
-        return np.sqrt(np.sum(diff**2)/self.v.shape[0])/np.sqrt(self.area)
-
-    def save_results(self, path, fate=True):
-        filename = f"{path}_coeffs.npz"
-
+    def save_results(self, path):
+        """<path>_coeffs.npz (true-geometry eigendecomposition, PCA transform, area) and
+        <path>_transformed_mesh.obj (the PCA-aligned mesh)."""
         save_dict = {
-            'coeffs_v': self.coeffs_v,
             'eigvals': self.eigvals,
             'eigvecs': self.eigvecs,
-            'modes': self.modes,
-            'mass_matrix': self.mass_matrix,
             'transform_matrix': self.transform_matrix,
             'lmax': self.lmax,
             'area': self.area
         }
-        if fate:
-            save_dict['coeffs_fm'] = self.coeffs_fm
-            save_dict['field_names'] = self.field_names
-        np.savez(filename, **save_dict)
-
+        if self.eigvecs is None:            # complexity-only run (hks=False)
+            del save_dict['eigvals'], save_dict['eigvecs']
+        np.savez(f"{path}_coeffs.npz", **save_dict)
         igl.write_triangle_mesh(path + '_transformed_mesh.obj', self.v, self.f)
 
     def load_results(self, path):
+        """Inverse of save_results."""
         data = np.load(path + '_coeffs.npz', allow_pickle=True)
-        self.coeffs_v = data['coeffs_v']
-        # fate coefficients are optional (shape-only runs skip them)
-        if 'coeffs_fm' in data.files:
-            self.coeffs_fm = data['coeffs_fm']
-            self.field_names = data['field_names'].tolist()
-        self.eigvals = data['eigvals']
-        self.eigvecs = data['eigvecs']
-        self.modes = data['modes']
-        self.mass_matrix = data['mass_matrix'].item()
+        # absent for complexity-only (hks=False) runs
+        self.eigvals = data['eigvals'] if 'eigvals' in data.files else None
+        self.eigvecs = data['eigvecs'] if 'eigvecs' in data.files else None
         self.lmax = int(data['lmax'])
         self.transform_matrix = data['transform_matrix']
-
-        self.area = data['area']
+        self.area = float(data['area'])
         self.v, self.f = igl.read_triangle_mesh(path + '_transformed_mesh.obj')

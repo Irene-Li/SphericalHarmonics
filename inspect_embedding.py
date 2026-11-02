@@ -2,13 +2,20 @@
 """
 Interactive viewer for a saved 2D embedding of organoids.
 
-Two linked windows:
-  * a matplotlib window  - the embedding as a true 2D scatter (click a point)
-                           plus a bar chart of the selected organoid's fate %.
-  * a polyscope window   - ONLY the selected organoid's 3D mesh, which you can
-                           rotate/zoom freely and independently of the scatter.
-                           Switch which fate marker colors the mesh with
-                           polyscope's mesh UI.
+One window with two side-by-side panels (drag the divider to resize them):
+  * Embedding (left) - the embedding as a true 2D scatter. Click a point to
+                       load that organoid; hover to see its id in the status
+                       bar. "Colour points by" picks the scatter colouring and
+                       the toolbar underneath zooms / pans / saves the plot.
+  * Organoid (right) - ONLY the selected organoid's 3D mesh, which you can
+                       rotate (drag), zoom (scroll) and pan (shift-drag)
+                       independently of the scatter. "Colour organoid by" picks
+                       the per-vertex overlay (fate marker, or HKS with
+                       --source pipeline); the choice is kept across organoids.
+                       Below it, a bar chart of the organoid's fate fractions.
+  The 3D camera is kept when you click another organoid, so meshes (all
+  PCA-aligned and scaled to a unit sphere) are compared from the same
+  viewpoint; "Reset view" goes back to the default front view.
 
 The embedding is written by `src.utils.save_embedding` (e.g. from
 dim_red.ipynb).
@@ -32,11 +39,9 @@ Mesh source is selectable with --source:
               - bag-of-features ('bof_<vocab>_word<k>'): per-vertex soft
                 assignment to each vocabulary in compute_master_npz.VOCABS
                 (kmeans_variable, pca_variable — same vocabs/encoding as the
-                'hks_bof_coeffs__*' columns in master.npz), loaded from sim/.
-            Fate fields come from the saved fate coefficients when the npz has
-            them (fractal_output runs with compute_fate=True); otherwise
-            they're read from a matching .vtp if one is found
-            (main_dataset/sup_dataset/pert2, which only save shape coefficients).
+                'hks_bof_power__*' columns in master.npz), loaded from output/.
+            Fate fields are read from a matching .vtp if one is found (the
+            pipeline does not decompose fate fields).
 
 In both modes, --data_root is walked once and meshes/pipeline files are found
 by filename regardless of nesting, so any layout works.
@@ -47,18 +52,15 @@ dataset's config.json is present next to the meshes it is used (and
 auto-discovered) to give the fate fields friendly names; otherwise the raw vtp
 field names are shown.
 
-Opens two separate windows (scatter + organoid); drag them apart so they
-don't overlap.
-
 Run from the repository root, in the `scmpx` conda env:
 
     python inspect_embedding.py \
-        --embedding Data/embeddings/hks_emb.npz --data_root Data
+        --embedding output/embeddings/hks_emb.npz --data_root Data
 
     python inspect_embedding.py \
-        --embedding Data/embeddings/hks_emb.npz --data_root Data --source pipeline
+        --embedding output/embeddings/hks_emb.npz --data_root Data --source pipeline
 
-Click a point in the scatter to load that organoid. Close either window to quit.
+Click a point in the scatter to load that organoid. Close the window to quit.
 """
 
 import argparse
@@ -67,24 +69,38 @@ import os
 import sys
 
 import numpy as np
-import polyscope as ps
-import polyscope.imgui as psim
-import matplotlib.pyplot as plt
+# conda-forge's vtk links its optional C++ Qt module against Qt6; `import vtk`
+# (here and in src/) would load it next to PyQt5's Qt5 and the two clash on
+# macOS. The viewer doesn't use it, and vtkmodules.all skips it on ImportError.
+sys.modules.setdefault("vtkmodules.vtkRenderingQt", None)
+# Import the Qt binding first so matplotlib's Qt backend and VTK's Qt widget
+# both pick up PyQt5.
+from PyQt5 import QtCore, QtWidgets
+import matplotlib
+matplotlib.use("QtAgg")   # any stray pyplot figure lands in Qt too
 import matplotlib.ticker as mticker
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.colors import BoundaryNorm, ListedColormap, Normalize
-from matplotlib.widgets import RadioButtons
+from matplotlib.figure import Figure
+import vtk
+import vtkmodules.qt
+vtkmodules.qt.PyQtImpl = "PyQt5"   # VTK would otherwise prefer PySide6/PyQt6 if installed
+from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+from vtkmodules.util.numpy_support import ID_TYPE_CODE, numpy_to_vtk, numpy_to_vtkIdTypeArray
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src import utils
 from src.fatemarkers import FateMarkers
 from compute_master_npz import find_times, hks_unit_area, encode_vocab, load_vocabs
 
-ORG_NAME = "organoid"
 DEFAULT_MARKER = "lgr"
 COMBO_MARKERS = ("STEM", "EC", "PANETH")   # must all be present in perc_* fields
-HKS_TIMES = [1, 4, 25, 100]   # matches compute_master_npz.SPARSE_TS / sim/encodings_*.vtp
+HKS_TIMES = [1, 4, 25, 100]   # matches compute_master_npz.SPARSE_TS / output/encodings_*.vtp
 HKS_DEFAULT_TIME = 25         # shown by default in --source pipeline (mid diffusion scale)
 COEFFS_SUFFIX = "_coeffs.npz"
+SURFACE_ONLY = "(surface only)"   # 'Colour organoid by' entry: plain shaded mesh
+MESH_COLOR = (0.55, 0.65, 0.85)
+PICK_RADIUS_PT = 12           # a click selects the nearest point within this radius
 
 
 def _fit_mesh(v, radius=1.0):
@@ -95,19 +111,49 @@ def _fit_mesh(v, radius=1.0):
     return v.astype(np.float32)
 
 
+def _vtk_mesh(v, f):
+    """vtkPolyData from a (V, 3) vertex array and an (F, k) face array."""
+    pts = vtk.vtkPoints()
+    pts.SetData(numpy_to_vtk(np.ascontiguousarray(v, dtype=np.float32), deep=True))
+    f = np.asarray(f, dtype=ID_TYPE_CODE)
+    offsets = np.arange(0, f.size + 1, f.shape[1], dtype=ID_TYPE_CODE)
+    polys = vtk.vtkCellArray()
+    polys.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                  numpy_to_vtkIdTypeArray(np.ascontiguousarray(f.ravel()), deep=True))
+    mesh = vtk.vtkPolyData()
+    mesh.SetPoints(pts)
+    mesh.SetPolys(polys)
+    return mesh
+
+
+def _vtk_lut(cmap_name="viridis", n=256):
+    """A matplotlib colormap as a vtkLookupTable (NaN -> light grey)."""
+    lut = vtk.vtkLookupTable()
+    lut.SetNumberOfTableValues(n)
+    lut.Build()
+    for i, rgba in enumerate(matplotlib.colormaps[cmap_name](np.linspace(0, 1, n))):
+        lut.SetTableValue(i, *rgba)
+    lut.SetNanColor(0.8, 0.8, 0.8, 1.0)
+    return lut
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--embedding", required=True,
                     help="path to an embedding .npz (from utils.save_embedding)")
     ap.add_argument("--data_root", default="Data",
-                    help="folder to search (recursively) for the original .vtp "
+                    help="folder to search (recursively) for the original .vtp / .stl "
                          "meshes. Meshes are found by filename, so any layout works.")
     ap.add_argument("--source", choices=["vtp", "pipeline"], default="vtp",
                     help="'vtp' (default) loads straight from the .vtp; 'pipeline' "
                          "loads the precomputed '{stem}_coeffs.npz' + "
                          "'{stem}_transformed_mesh.obj' instead, which also enables "
                          "HKS scalar overlays (see module docstring).")
+    ap.add_argument("--groups", default=None,
+                    help="hand-picked shape groups json (a list of lists of organoid ids), "
+                         "shown as the 'uid_group' colouring. Default: "
+                         "<data_root>/uid_groups.json when it exists.")
     args = ap.parse_args()
     print(f"Mesh source: {args.source}"
           + ("  (HKS overlays enabled)" if args.source == "pipeline" else ""))
@@ -139,16 +185,16 @@ def main():
     # longest trailing part of the id against an indexed stem.
     vtp_index = {}
     pipeline_index = {}   # stem -> [base path, i.e. path without '_coeffs.npz']
-    for root, _dirs, files in os.walk(args.data_root):
+    for root, _dirs, files in os.walk(args.data_root, followlinks=True):   # datasets may be symlinks
         for fn in files:
-            if fn.endswith(".vtp"):
+            if fn.endswith((".vtp", ".stl")):     # .stl: geometry only (e.g. wnt_pert)
                 vtp_index.setdefault(fn[:-4], []).append(os.path.join(root, fn))
             elif fn.endswith(COEFFS_SUFFIX):
                 stem = fn[:-len(COEFFS_SUFFIX)]
                 pipeline_index.setdefault(stem, []).append(os.path.join(root, stem))
     n_vtp = sum(len(v) for v in vtp_index.values())
     n_pipeline = sum(len(v) for v in pipeline_index.values())
-    print(f"Indexed {n_vtp} .vtp files and {n_pipeline} pipeline coeffs under {args.data_root}")
+    print(f"Indexed {n_vtp} .vtp/.stl meshes and {n_pipeline} pipeline coeffs under {args.data_root}")
     if n_vtp == 0 and args.source == "vtp":
         print(f"  [warn] no .vtp meshes found under {args.data_root!r} — "
               f"meshes won't load. Pass --data_root <folder with the .vtp files>.")
@@ -186,21 +232,11 @@ def main():
         return _resolve_by_stem(full_id, pipeline_index)
 
     # ---- bag-of-features vocabularies (--source pipeline only) ---------
-    # Same vocabs/encoding compute_master_npz uses for the 'hks_bof_coeffs__*'
+    # Same vocabs/encoding compute_master_npz uses for the 'hks_bof_power__*'
     # columns in master.npz (VOCABS: kmeans_variable, pca_variable), loaded once
     # here and reused for every organoid as per-vertex 'bof_<vocab>_word<k>'
     # overlays (soft-assignment encoding, not the spherical-harmonic coeffs).
     bof_vocabs = load_vocabs() if args.source == "pipeline" else []
-
-    def shorten_id(full_id):
-        """'main_dataset_day1p5_A01_42' -> 'md_1p5_a01_42' (cosmetic title)."""
-        toks = full_id.split("_")
-        for i, t in enumerate(toks):
-            if t.startswith("day"):
-                ds = "".join(w[0] for w in toks[:i]) or "?"
-                rest = "_".join(toks[i + 1:]).lower()
-                return f"{ds}_{t[len('day'):]}_{rest}"
-        return full_id
 
     # ---- optional config.json for friendly fate names ------------------
     # config.json is not required.  If one sits next to (or above) a mesh, it
@@ -303,7 +339,7 @@ def main():
         cat_levels["agg_cluster"] = [(c, "low-cplx" if c == 0 else f"cluster {c}")
                                      for c in uniq_ag]
         n_high = sum(c != 0 for c in uniq_ag)
-        base = plt.get_cmap("tab10" if n_high <= 10 else "tab20")
+        base = matplotlib.colormaps["tab10" if n_high <= 10 else "tab20"]
         hi = [base(i % base.N) for i in range(n_high)]
         cat_cmaps["agg_cluster"] = (["lightgrey"] + hi) if 0 in uniq_ag else hi
         color_options.insert(4, "agg_cluster")
@@ -318,32 +354,6 @@ def main():
         color_fields["centre_dist"] = (cdist, "viridis_r", (0.0, hi_clip) if hi_clip else None)
         color_options.insert(5, "centre_dist")
 
-    # uid_groups membership (categorical): point-field saved by dim_red
-    # as 'uid_group' (0 = none, g+1 = membership in hand-picked group g).
-    if "uid_group" in emb:
-        grp_code = emb["uid_group"].astype(float)
-        if (grp_code > 0).any():
-            ng = int(grp_code.max())
-            color_fields["uid_group"] = (grp_code, "tab10", (0, ng))
-            cat_levels["uid_group"] = ([(0, "none")]
-                                       + [(g + 1, f"group {g + 1}") for g in range(ng)])
-            base = plt.get_cmap("tab10" if ng <= 9 else "tab20")
-            cat_cmaps["uid_group"] = ["lightgrey"] + [base(i % base.N) for i in range(ng)]
-            color_options.append("uid_group")
-            print(f"uid_group: {int((grp_code > 0).sum())} of {len(ids)} points labelled "
-                  f"({ng} groups)")
-
-    # trusted organoids (categorical): point-field 'trusted' (1 if the organoid
-    # is in any confident small-chamfer pair, i.e. it supervises the chamfer term).
-    if "trusted" in emb:
-        is_trusted = emb["trusted"].astype(float)
-        if is_trusted.any():
-            color_fields["trusted"] = (is_trusted, "tab10", (0, 1))
-            cat_levels["trusted"] = [(0, "untrusted"), (1, "trusted")]
-            cat_cmaps["trusted"] = ["lightgrey", "crimson"]
-            color_options.append("trusted")
-            print(f"trusted: {int(is_trusted.sum())} of {len(ids)} points")
-
     # perturbation/genotype condition (categorical): point-field 'condition'
     # saved by dim_red ('WT' for the wild-type datasets, the drug token for pert2).
     if conditions is not None:
@@ -355,84 +365,34 @@ def main():
             color_options.append("condition")
             print(f"condition: {len(uniq_cond)} levels {uniq_cond}")
 
-    # active_quantity persists the chosen colouring across organoid clicks;
-    # categories groups overlay names into Fate / HKS-shape; quant_values holds
-    # each overlay's per-vertex array so we can re-enable it by re-adding.
-    state = {"org": None, "active_quantity": DEFAULT_MARKER,
-             "categories": {}, "quant_values": {}}
-
-    def _set_active(name):
-        """Show the overlay `name` (and hide the previously shown one), then
-        remember it so the choice persists across organoids.
-
-        polyscope's add_scalar_quantity returns None (no handle to toggle), but
-        re-adding a quantity with an existing name replaces it in place — so we
-        re-add the target enabled and the previous one disabled. Only these two
-        are touched, regardless of how many overlays the organoid has."""
-        org, vals = state["org"], state["quant_values"]
-        if org is None or name not in vals:
-            return
-        prev = state["active_quantity"]
-        if prev and prev != name and prev in vals:
-            org.add_scalar_quantity(prev, vals[prev], cmap="viridis", enabled=False)
-        org.add_scalar_quantity(name, vals[name], cmap="viridis", enabled=True)
-        state["active_quantity"] = name
-
-    def _default_quantity(cats):
-        """Fallback colouring when the remembered overlay is absent here."""
-        if DEFAULT_MARKER in cats.get("Fate", []):
-            return DEFAULT_MARKER
-        hks_def = f"hks_t{HKS_DEFAULT_TIME}"
-        if hks_def in cats.get("HKS / shape", []):
-            return hks_def
-        for names in cats.values():
-            if names:
-                return names[0]
-        return None
-
-    ACCENT = (0.35, 0.85, 1.0, 1.0)   # cyan section headers, to stand out
-
-    def quantity_ui_callback():
-        """Standalone floating panel (separate from polyscope's structure UI):
-        overlays split into Fate vs HKS/shape categories, radio-selected (one
-        active at a time), persisted across organoids via _set_active."""
-        if not state["quant_values"]:
-            return
-        # own window, offset to the right of polyscope's top-left panel so it
-        # reads as a distinct control; draggable/resizable after first show.
-        psim.SetNextWindowPos((360.0, 20.0), psim.ImGuiCond_FirstUseEver)
-        psim.SetNextWindowSize((250.0, 430.0), psim.ImGuiCond_FirstUseEver)
-        psim.Begin("Colour organoid by")
-        chosen = None
-        for cat, names in state["categories"].items():
-            if not names:
-                continue
-            psim.PushStyleColor(psim.ImGuiCol_Text, ACCENT)
-            psim.SeparatorText(cat)
-            psim.PopStyleColor()
-            for nm in names:
-                # '##<cat>' keeps the visible label but gives each radio a unique
-                # ImGui ID (avoids conflicting-ID errors on duplicate names).
-                if psim.RadioButton(f"{nm}##{cat}", state["active_quantity"] == nm):
-                    chosen = nm
-        psim.End()
-        if chosen is not None:
-            _set_active(chosen)
+    # hand-picked shape groups (categorical), read from the groups json rather than the
+    # embedding, so any embedding can be coloured by them: 0 = in no group, g + 1 = in
+    # group g (numbered from 1 as in the json's order).
+    groups_path = args.groups or os.path.join(args.data_root, "uid_groups.json")
+    if os.path.isfile(groups_path):
+        with open(groups_path) as fh:
+            groups = json.load(fh)
+        group_of = {}
+        for g, members in enumerate(groups):
+            for u in members:
+                group_of.setdefault(u, g + 1)
+        grp_code = np.array([group_of.get(u, 0) for u in ids], dtype=float)
+        if (grp_code > 0).any():
+            ng = len(groups)
+            color_fields["uid_group"] = (grp_code, "tab10", (0, ng))
+            cat_levels["uid_group"] = ([(0, "none")]
+                                       + [(g + 1, f"group {g + 1}") for g in range(ng)])
+            base = matplotlib.colormaps["tab10" if ng <= 10 else "tab20"]
+            cat_cmaps["uid_group"] = ["lightgrey"] + [base(i % base.N) for i in range(ng)]
+            color_options.append("uid_group")
+            print(f"uid_group: {int((grp_code > 0).sum())} of {len(ids)} points in "
+                  f"{ng} hand-picked groups ({groups_path})")
+    elif args.groups:
+        print(f"  [warn] groups file {args.groups} not found — no 'uid_group' colouring")
 
     # ====================================================================
-    # polyscope window: only the organoid mesh (independent rotation)
+    # mesh loaders: (vertices, faces, overlay categories, overlay values)
     # ====================================================================
-    ps.init()
-    ps.set_program_name("Organoid")
-    ps.set_up_dir("y_up")
-    ps.set_ground_plane_mode("none")
-    ps.set_navigation_style("turntable")
-    # show only our custom 'Colour organoid by' window: drop polyscope's default
-    # panels (its Structures / Quantities selectors) and the auto wrapper window
-    # it would otherwise open around the user callback (we open our own Begin).
-    ps.set_build_default_gui_panels(False)
-    ps.set_open_imgui_window_for_user_callback(False)
-
     def _load_organoid_vtp(full_id):
         """Load mesh + fate fields straight from the .vtp (current default)."""
         vtp = resolve_vtp(full_id)
@@ -451,9 +411,8 @@ def main():
             print(f"  [warn] failed to load {full_id} from {vtp}: {e}")
             return None
 
-        org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(v), f, smooth_shade=True,
-                                       color=(0.55, 0.65, 0.85))
-        # overlays added disabled; load_organoid enables the persisted choice.
+        # overlays grouped into Fate vs HKS/shape; load_organoid shows the
+        # persisted choice.
         cats = {"Fate": [], "HKS / shape": []}
         vals = {}
         if fields is not None and len(field_names):
@@ -461,20 +420,17 @@ def main():
                 friendly = field_to_friendly.get(fld, fld)
                 if friendly in vals:             # skip duplicate field names
                     continue
-                org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis", enabled=False)
                 vals[friendly] = fields[:, i]
                 cats["Fate"].append(friendly)
-        return org, cats, vals
+        return _fit_mesh(v), f, cats, vals
 
     def _load_organoid_pipeline(full_id):
         """Load the precomputed coeffs.npz + transformed_mesh.obj (--source pipeline).
 
-        Geometry, eigenvalues/eigenvectors, and (when saved) the fate-field
-        coefficients all come from the npz/obj — no re-alignment or
-        re-eigendecomposition. The saved eigendecomposition also unlocks HKS
-        scalar overlays. Datasets whose pipeline run only computed shape
-        coefficients (no coeffs_fm) fall back to a matching .vtp for raw fate
-        fields; if none is found the mesh still loads with HKS overlays only.
+        Geometry and eigenvalues/eigenvectors come from the npz/obj — no
+        re-alignment or re-eigendecomposition. The saved eigendecomposition also
+        unlocks HKS scalar overlays. Fate fields are the raw fields of a matching
+        .vtp; if none is found the mesh still loads with HKS overlays only.
         """
         base = resolve_pipeline_base(full_id)
         if base is None:
@@ -490,37 +446,26 @@ def main():
 
         cfg, field_to_friendly = find_cfg(base)
 
-        # fate fields: prefer the saved fate coefficients (inverse spherical-harmonic
-        # reconstruction back to per-vertex values); fall back to a matching .vtp's
-        # raw fields when the npz only has shape coefficients (vtp_flat runs never
-        # compute fate, see run_new_meshes.run_vtp_flat).
+        # fate fields: a matching .vtp's raw fields (the pipeline does not decompose
+        # fate fields, see run_new_meshes).
         fields, field_names = None, None
-        if getattr(m, "coeffs_fm", None) is not None:
+        vtp = resolve_vtp(full_id)
+        if vtp is not None and not vtp.endswith(".stl"):   # .stl has no fate fields
             try:
-                fields = m.reconstruct_from_coeffs(m.coeffs_fm, lmax=m.lmax)
-                field_names = m.field_names
+                mv = FateMarkers()
+                mv.load_mesh_from_file(vtp)
+                if cfg is not None and cfg.get("annotation_names"):
+                    mv._refine_markers(cfg["annotation_names"], cfg.get("exclusion_rules", {}))
+                if mv.fields.shape[0] == m.v.shape[0]:
+                    fields, field_names = mv.fields, mv.field_names
+                else:
+                    print(f"  [warn] vertex-count mismatch between pipeline mesh "
+                          f"and .vtp for {full_id} — skipping fate fields")
             except Exception as e:
-                print(f"  [warn] failed to reconstruct fate fields for {full_id}: {e}")
-        if fields is None:
-            vtp = resolve_vtp(full_id)
-            if vtp is not None:
-                try:
-                    mv = FateMarkers()
-                    mv.load_mesh_from_file(vtp)
-                    if cfg is not None and cfg.get("annotation_names"):
-                        mv._refine_markers(cfg["annotation_names"], cfg.get("exclusion_rules", {}))
-                    if mv.fields.shape[0] == m.v.shape[0]:
-                        fields, field_names = mv.fields, mv.field_names
-                    else:
-                        print(f"  [warn] vertex-count mismatch between pipeline mesh "
-                              f"and .vtp for {full_id} — skipping fate fields")
-                except Exception as e:
-                    print(f"  [warn] failed to read fate fields from .vtp for {full_id}: {e}")
+                print(f"  [warn] failed to read fate fields from .vtp for {full_id}: {e}")
 
-        org = ps.register_surface_mesh(ORG_NAME, _fit_mesh(m.v), m.f, smooth_shade=True,
-                                       color=(0.55, 0.65, 0.85))
-        # All overlays are added disabled and grouped into Fate vs HKS/shape;
-        # load_organoid enables the persisted choice (default: an HKS overlay).
+        # All overlays are grouped into Fate vs HKS/shape; load_organoid shows
+        # the persisted choice (default: an HKS overlay).
         cats = {"Fate": [], "HKS / shape": []}
         vals = {}
         if fields is not None and len(field_names):
@@ -528,29 +473,25 @@ def main():
                 friendly = field_to_friendly.get(fld, fld)
                 if friendly in vals:             # skip duplicate field names
                     continue
-                org.add_scalar_quantity(friendly, fields[:, i], cmap="viridis", enabled=False)
                 vals[friendly] = fields[:, i]
                 cats["Fate"].append(friendly)
 
         # per-vertex HKS at a few diffusion times, straight from the saved
         # eigendecomposition (no recomputation needed). hks_t25 is shown by
-        # default; the others are added alongside it for the quantities list.
+        # default; the others are listed alongside it.
         try:
-            hks = m.compute_hks_for_new_times(HKS_TIMES, coeffs=False)
+            hks = m.compute_hks_for_new_times(HKS_TIMES)
             for k, t in enumerate(HKS_TIMES):
                 nm = f"hks_t{t}"
-                org.add_scalar_quantity(nm, hks[:, k], cmap="viridis", enabled=False)
                 vals[nm] = hks[:, k]
                 cats["HKS / shape"].append(nm)
-            print(f"  HKS overlays added: {[f'hks_t{t}' for t in HKS_TIMES]} "
-                  f"(pick one in the 'Colour organoid by' panel — HKS / shape section)")
         except Exception as e:
             print(f"  [warn] failed to compute HKS for {full_id}: {e}")
 
         # bag-of-features: soft-assign per-vertex HKS (sampled at each vocab's own
         # diffusion times) to that vocabulary's words. Same encoding as
-        # compute_master_npz.compute_bof_coeffs, but evaluated per-vertex instead
-        # of projected to spherical-harmonic coefficients.
+        # compute_master_npz.compute_bof_power, but evaluated per-vertex instead
+        # of expanded in spherical harmonics.
         for v in bof_vocabs:
             try:
                 ts = find_times(m.area) if v["time"] == "variable" else np.asarray(v["ts"])
@@ -558,66 +499,69 @@ def main():
                 encoding = encode_vocab(hks_scaled, v)        # (n_verts, n_words)
                 for k in range(encoding.shape[1]):
                     nm = f"bof_{v['name']}_word{k}"
-                    org.add_scalar_quantity(nm, encoding[:, k], cmap="viridis", enabled=False)
                     vals[nm] = encoding[:, k]
                     cats["HKS / shape"].append(nm)
-                print(f"  bag-of-features added: bof_{v['name']}_word0..{encoding.shape[1] - 1}")
             except Exception as e:
                 print(f"  [warn] failed to compute '{v['name']}' bag-of-features "
                       f"for {full_id}: {e}")
 
-        return org, cats, vals
+        return _fit_mesh(m.v), m.f, cats, vals
 
-    def load_organoid(idx):
-        full_id = ids[idx]
-        if state["org"] is not None:
-            state["org"].remove()
-            state["org"] = None
-        state["categories"], state["quant_values"] = {}, {}
-
-        loader = _load_organoid_pipeline if args.source == "pipeline" else _load_organoid_vtp
-        result = loader(full_id)
-        if result is None:
-            return
-        org, cats, vals = result
-
-        org.reset_transform()
-        state["org"] = org
-        state["categories"] = cats
-        state["quant_values"] = vals
-        # re-apply the remembered colouring so it persists across organoids;
-        # fall back to a sensible default if this organoid lacks that overlay.
-        allnames = [n for names in cats.values() for n in names]
-        active = state["active_quantity"] if state["active_quantity"] in allnames \
-            else _default_quantity(cats)
-        if active is not None:
-            _set_active(active)
-        ps.reset_camera_to_home_view()
+    def _default_quantity(cats):
+        """Fallback colouring when the remembered overlay is absent here."""
+        if DEFAULT_MARKER in cats.get("Fate", []):
+            return DEFAULT_MARKER
+        hks_def = f"hks_t{HKS_DEFAULT_TIME}"
+        if hks_def in cats.get("HKS / shape", []):
+            return hks_def
+        for names in cats.values():
+            if names:
+                return names[0]
+        return SURFACE_ONLY
 
     # ====================================================================
-    # matplotlib window: 2D scatter + fate% bar + color selector
+    # one Qt window: embedding scatter (left) | organoid panel (right)
     # ====================================================================
-    fig = plt.figure(figsize=(14, 6))
-    fig.canvas.manager.set_window_title("Embedding")
-    ax_radio = fig.add_axes([0.005, 0.08, 0.085, 0.86], frameon=True)  # color selector
-    ax = fig.add_axes([0.16, 0.10, 0.46, 0.82])      # scatter
-    ax_bar = fig.add_axes([0.82, 0.10, 0.16, 0.82])  # fate % bar
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    win = QtWidgets.QMainWindow()
+    win.setWindowTitle(f"Embedding — {os.path.basename(args.embedding)} "
+                       f"({method}, {len(ids)} organoids)")
+    split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+    win.setCentralWidget(split)
+    status = win.statusBar()
 
-    markersize = 5
+    def _labelled_row(label, widget):
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(label))
+        row.addWidget(widget)
+        row.addStretch(1)
+        return row
 
+    # ---- left: 2D scatter + colour selector -----------------------------
+    left = QtWidgets.QWidget()
+    lv = QtWidgets.QVBoxLayout(left)
+    lv.setContentsMargins(6, 6, 6, 0)
+    color_combo = QtWidgets.QComboBox()
+    color_combo.addItems(color_options)
+    color_combo.setMaxVisibleItems(30)
+    fig = Figure(layout="constrained")
+    canvas = FigureCanvasQTAgg(fig)
+    toolbar = NavigationToolbar2QT(canvas, left)
+    lv.addLayout(_labelled_row("Colour points by:", color_combo))
+    lv.addWidget(canvas, 1)
+    lv.addWidget(toolbar)
+    split.addWidget(left)
+
+    ax = fig.add_subplot()
     init_c, init_cmap, _ = color_fields["l_cross"]
-    sc = ax.scatter(xy[:, 0], xy[:, 1], c=init_c, cmap=init_cmap, s=markersize, alpha=0.85)
+    sc = ax.scatter(xy[:, 0], xy[:, 1], c=init_c, cmap=init_cmap, s=6, alpha=0.85,
+                    linewidths=0)
     hl = ax.scatter([], [], s=160, facecolors="none", edgecolors="red", linewidths=2,
                     zorder=6)
-    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
-    cbar.set_label("l_cross")
-    ax.set_title(f"{method} embedding  ({len(ids)} organoids) — click a point")
-    ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
-
-    ax_radio.set_title("color by", fontsize=9)
-    radio = RadioButtons(ax_radio, color_options)
-    for t in radio.labels:
-        t.set_fontsize(8)
+    cbar = fig.colorbar(sc, ax=ax)
+    ax.set_title(f"{method} embedding ({len(ids)} organoids) — click a point")
+    ax.set_xlabel("dim 1")
+    ax.set_ylabel("dim 2")
 
     def recolor(field):
         c, cmap, clim = color_fields[field]
@@ -630,7 +574,7 @@ def main():
             if field in cat_cmaps:
                 disc = ListedColormap(cat_cmaps[field])
             else:
-                base = plt.get_cmap("tab10" if n <= 10 else "tab20")
+                base = matplotlib.colormaps["tab10" if n <= 10 else "tab20"]
                 disc = ListedColormap([base(i % base.N) for i in range(n)])
             sc.set_cmap(disc)
             sc.set_norm(BoundaryNorm(np.arange(n + 1) - 0.5, n))
@@ -649,11 +593,39 @@ def main():
             cbar.locator = mticker.AutoLocator()
             cbar.update_ticks()
         cbar.set_label(f"log({field}+1e-3)" if field in fate_set else field)
-        fig.canvas.draw_idle()
-    radio.on_clicked(recolor)
-    recolor("l_cross")   # apply the notebook clim/label to the initial view
+        canvas.draw_idle()
+    color_combo.currentTextChanged.connect(recolor)
+
+    # ---- right: organoid 3D view over the fate-fraction bars ------------
+    right = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+    org_panel = QtWidgets.QWidget()
+    rv = QtWidgets.QVBoxLayout(org_panel)
+    rv.setContentsMargins(6, 6, 6, 0)
+    info = QtWidgets.QLabel("Click a point in the embedding to load an organoid.")
+    info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)   # copyable id
+    info.setWordWrap(True)
+    quant_combo = QtWidgets.QComboBox()
+    quant_combo.setMaxVisibleItems(30)
+    quant_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+    reset_btn = QtWidgets.QPushButton("Reset view")
+    quant_row = _labelled_row("Colour organoid by:", quant_combo)
+    quant_row.addWidget(reset_btn)
+    vtk_widget = QVTKRenderWindowInteractor(org_panel)
+    rv.addWidget(info)
+    rv.addLayout(quant_row)
+    rv.addWidget(vtk_widget, 1)
+    right.addWidget(org_panel)
+
+    bar_fig = Figure(layout="constrained")
+    bar_canvas = FigureCanvasQTAgg(bar_fig)
+    bar_canvas.setMinimumHeight(120)
+    right.addWidget(bar_canvas)
+    right.setStretchFactor(0, 3)
+    right.setStretchFactor(1, 1)
+    split.addWidget(right)
 
     # fate % horizontal bar
+    ax_bar = bar_fig.add_subplot()
     bars = ax_bar.barh(np.arange(len(fate_labels)), np.zeros(len(fate_labels)),
                        color="tab:blue")
     ax_bar.set_yticks(np.arange(len(fate_labels)))
@@ -661,39 +633,210 @@ def main():
     ax_bar.invert_yaxis()
     ax_bar.set_xlim(0, 1)
     ax_bar.set_xlabel("cell fraction")
-    ax_bar.set_title("fate")
+    if not fate_labels:
+        bar_canvas.hide()
+
+    # VTK scene: one mesh actor whose input is swapped per organoid, coloured
+    # by a selectable point-data array through a shared viridis lookup table.
+    ren = vtk.vtkRenderer()
+    ren.SetBackground(1.0, 1.0, 1.0)
+    ren.SetBackground2(0.82, 0.86, 0.92)
+    ren.GradientBackgroundOn()
+    render_window = vtk_widget.GetRenderWindow()
+    render_window.AddRenderer(ren)
+    iren = render_window.GetInteractor()
+    iren.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+
+    lut = _vtk_lut("viridis")
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetLookupTable(lut)
+    mapper.SetScalarModeToUsePointFieldData()
+    mapper.InterpolateScalarsBeforeMappingOn()
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(*MESH_COLOR)
+    actor.GetProperty().SetSpecular(0.2)
+    actor.GetProperty().SetSpecularPower(20)
+    actor.VisibilityOff()
+    ren.AddActor(actor)
+
+    scalar_bar = vtk.vtkScalarBarActor()
+    scalar_bar.SetLookupTable(lut)
+    scalar_bar.SetNumberOfLabels(5)
+    scalar_bar.SetLabelFormat("%.3g")
+    scalar_bar.SetPosition(0.88, 0.15)
+    scalar_bar.SetWidth(0.1)
+    scalar_bar.SetHeight(0.7)
+    scalar_bar.SetMaximumWidthInPixels(60)
+    scalar_bar.UnconstrainedFontSizeOn()
+    labels_prop = scalar_bar.GetLabelTextProperty()
+    labels_prop.SetFontSize(14)
+    labels_prop.SetColor(0.15, 0.15, 0.15)
+    labels_prop.ShadowOff()
+    labels_prop.ItalicOff()
+    labels_prop.BoldOff()
+    scalar_bar.VisibilityOff()
+    ren.AddActor2D(scalar_bar)
+
+    # active_quantity persists the chosen colouring across organoid clicks;
+    # quant_values holds the current organoid's per-vertex overlay arrays.
+    state = {"active_quantity": DEFAULT_MARKER, "quant_values": {}, "camera_set": False}
+
+    def reset_view():
+        """Default front view: y up, looking down -z, mesh filling the panel."""
+        cam = ren.GetActiveCamera()
+        cam.SetFocalPoint(0.0, 0.0, 0.0)
+        cam.SetPosition(0.0, 0.0, 1.0)
+        cam.SetViewUp(0.0, 1.0, 0.0)
+        ren.ResetCamera()
+        render_window.Render()
+    reset_btn.clicked.connect(reset_view)
+
+    def show_quantity(name):
+        """Colour the mesh by overlay `name` (anything else -> plain surface)."""
+        q = state["quant_values"].get(name)
+        if q is None:
+            mapper.ScalarVisibilityOff()
+            scalar_bar.VisibilityOff()
+        else:
+            finite = np.isfinite(q)
+            lo, hi = (float(q[finite].min()), float(q[finite].max())) if finite.any() else (0.0, 1.0)
+            hi = hi if hi > lo else lo + 1.0   # constant field (e.g. absent marker)
+            mapper.SelectColorArray(name)
+            mapper.SetScalarRange(lo, hi)
+            mapper.ScalarVisibilityOn()
+            scalar_bar.VisibilityOn()
+        render_window.Render()
+
+    def on_quantity_chosen(_index):
+        name = quant_combo.currentData()
+        if name is None:          # section header / separator
+            return
+        state["active_quantity"] = name
+        show_quantity(name)
+    quant_combo.currentIndexChanged.connect(on_quantity_chosen)
+
+    def fill_quantity_combo(cats, active):
+        """Rebuild 'Colour organoid by' (section headers are unselectable)."""
+        quant_combo.blockSignals(True)
+        quant_combo.clear()
+        quant_combo.addItem(SURFACE_ONLY, SURFACE_ONLY)
+        model = quant_combo.model()
+        for cat, names in cats.items():
+            if not names:
+                continue
+            quant_combo.insertSeparator(quant_combo.count())
+            quant_combo.addItem(cat)
+            header = model.item(quant_combo.count() - 1)
+            header.setEnabled(False)
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            for nm in names:
+                quant_combo.addItem(f"   {nm}", nm)
+        quant_combo.setCurrentIndex(max(0, quant_combo.findData(active)))
+        quant_combo.blockSignals(False)
+
+    def load_organoid(idx):
+        full_id = ids[idx]
+        loader = _load_organoid_pipeline if args.source == "pipeline" else _load_organoid_vtp
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            result = loader(full_id)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if result is None:
+            state["quant_values"] = {}
+            actor.VisibilityOff()
+            scalar_bar.VisibilityOff()
+            quant_combo.clear()
+            render_window.Render()
+            status.showMessage(f"Could not load {full_id} — see the terminal for details.")
+            return
+        v, f, cats, vals = result
+
+        mesh = _vtk_mesh(v, f)
+        for nm, q in vals.items():
+            arr = numpy_to_vtk(np.ascontiguousarray(q, dtype=np.float64), deep=True)
+            arr.SetName(nm)
+            mesh.GetPointData().AddArray(arr)
+        normals = vtk.vtkPolyDataNormals()   # smooth shading
+        normals.SetInputData(mesh)
+        normals.SplittingOff()
+        normals.ComputePointNormalsOn()
+        normals.Update()
+        mapper.SetInputData(normals.GetOutput())
+        actor.VisibilityOn()
+        state["quant_values"] = vals
+
+        # re-apply the remembered colouring so it persists across organoids;
+        # fall back to a sensible default if this organoid lacks that overlay.
+        remembered = state["active_quantity"]
+        active = remembered if remembered in vals or remembered == SURFACE_ONLY \
+            else _default_quantity(cats)
+        fill_quantity_combo(cats, active)
+        if not state["camera_set"]:
+            reset_view()
+            state["camera_set"] = True
+        else:
+            ren.ResetCameraClippingRange()
+        show_quantity(active)
 
     def select(idx):
         uid = ids[idx]
         hl.set_offsets([xy[idx]])
-        vals = perc_matrix[idx] if len(fate_labels) else np.zeros(0)
-        for b, v in zip(bars, vals):
-            b.set_width(v)
-        ax_bar.set_xlim(0, max(0.05, float(np.max(vals)) if len(vals) else 0.05))
-        div_str = f" D={hill_div[idx]:.2f}" if hill_div is not None else ""
-        cond_str = f" c={conditions[idx]}" if conditions is not None else ""
-        ax_bar.set_title(f"{shorten_id(uid)}\n"
-                         f"t={times[idx]} L={l_cross[idx]:.1f} a={areas[idx]:.0f}{div_str}{cond_str}")
-        fig.canvas.draw_idle()
+        canvas.draw_idle()
+        details = [f"time {times[idx]}", f"l_cross {l_cross[idx]:.1f}", f"area {areas[idx]:.0f}"]
+        if hill_div is not None:
+            details.append(f"diversity {hill_div[idx]:.2f}")
+        if agg_clusters is not None:
+            details.append(f"agg_cluster {int(agg_clusters[idx])}")
+        if conditions is not None:
+            details.append(f"condition {conditions[idx]}")
+        info.setText(f"<b>{uid}</b><br>{' · '.join(details)}")
+        if fate_labels:
+            vals = perc_matrix[idx]
+            for b, v in zip(bars, vals):
+                b.set_width(v)
+            ax_bar.set_xlim(0, max(0.05, 1.05 * float(np.max(vals))))
+            bar_canvas.draw_idle()
+        print(f"selected {uid}")
         load_organoid(idx)
 
+    def nearest_point(event):
+        """Index of the scatter point nearest a mouse event (None if too far)."""
+        if event.inaxes is not ax or event.x is None:
+            return None
+        pix = ax.transData.transform(xy)
+        d = np.hypot(pix[:, 0] - event.x, pix[:, 1] - event.y)
+        i = int(np.nanargmin(d))
+        return i if d[i] <= PICK_RADIUS_PT * fig.dpi / 72 else None
+
     def on_click(event):
-        if event.inaxes is not ax or event.xdata is None:
+        if event.button != 1 or toolbar.mode:   # ignore clicks while zooming/panning
             return
-        d = (xy[:, 0] - event.xdata) ** 2 + (xy[:, 1] - event.ydata) ** 2
-        select(int(np.argmin(d)))
-    fig.canvas.mpl_connect("button_press_event", on_click)
+        i = nearest_point(event)
+        if i is not None:
+            select(i)
+    canvas.mpl_connect("button_press_event", on_click)
 
-    # ---- run both event loops together ---------------------------------
-    ps.set_user_callback(quantity_ui_callback)
-    plt.ion()
-    plt.show(block=False)
-    select(0)  # show something on startup
+    def on_hover(event):
+        i = nearest_point(event)
+        if i is None:
+            status.clearMessage()
+        else:
+            status.showMessage(f"{ids[i]}   (time {times[i]}, l_cross {l_cross[i]:.1f})")
+    canvas.mpl_connect("motion_notify_event", on_hover)
 
-    while plt.fignum_exists(fig.number) and not ps.window_requests_close():
-        ps.frame_tick()
-        plt.pause(0.02)
-
+    # ---- run -------------------------------------------------------------
+    app.aboutToQuit.connect(vtk_widget.Finalize)
+    win.resize(1500, 850)
+    split.setSizes([780, 720])
+    win.show()
+    iren.Initialize()
+    recolor("l_cross")   # apply the notebook clim/label to the initial view
+    select(0)            # show something on startup
+    app.exec_()
     print("closed.")
 
 

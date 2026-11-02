@@ -1,111 +1,275 @@
 import numpy as np
 import igl
 import scipy.sparse as sp
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
 import jax
 import jax.numpy as jnp
-from jax import grad, jit, value_and_grad
-import optax
+from jax import jit, value_and_grad
 import pyshtools as pysh
+from scipy.optimize import minimize
 from sklearn.decomposition import PCA
-import vtk
 import src.utils as utils
+
+jax.config.update("jax_enable_x64", True)     # L-BFGS line searches need double precision
+
+
+# Spherical-map setting for the shape pipeline (compute_master_npz): long input edges split, then
+# 5000 faces, Delaunay edge flips and tangential smoothing; then radial start when it has no folds,
+# cotangent edges, signed areas per vertex, L-BFGS on up to 10 outer iterations, mu capped at 1e3.
+# Decimation leaves needle triangles and folded slivers, and these give some near-round organoids
+# a local map defect that shows up as a high complexity score.
+N_FACES      = 5000
+PRIMAL_STEPS = 500       # L-BFGS iterations per outer iteration, at most
+OUTER_ROUNDS = 10        # outer iterations, at most
+ENERGY_TOL   = 1e-3      # stop once the energy changes by less than this between outer iterations
+AREA_TOL     = 1e-3      # and the worst relative area error around a vertex is below this
+SPLIT_FACTOR = 1.5       # split input edges longer than this x the target edge length
+SMOOTH_PASSES = 1
+
+
+def _unit_normal(v, tri):
+    n = np.cross(v[tri[1]] - v[tri[0]], v[tri[2]] - v[tri[0]])
+    area = np.linalg.norm(n)
+    return n / max(area, 1e-15), area
+
+
+def _opposite_angles(v, a, b, c):
+    """Angle at vertex c of each triangle (a, b, c), for arrays of vertex indices."""
+    x, y = v[a] - v[c], v[b] - v[c]
+    return np.arctan2(np.linalg.norm(np.cross(x, y), axis=1), np.sum(x * y, axis=1))
+
+
+def delaunay_flips(v, f, passes=20):
+    """Flip edges whose two opposite angles sum to more than 180 degrees, worst first. This
+    removes needle triangles and folded slivers without moving or adding a vertex, so the
+    shape and SpHarm.birth stay valid. A flip is refused if it would leave a triangle
+    pointing further from the local surface than the ones it replaces. Returns the new faces."""
+    f = np.array(f)
+    corners = np.array([[0, 1, 2], [1, 2, 0], [2, 0, 1]])
+    for _ in range(passes):
+        # All half-edges a->b with their opposite vertex c and face, as flat arrays
+        a, b, c = f[:, corners].transpose(2, 0, 1).reshape(3, -1)
+        face = np.repeat(np.arange(len(f)), 3)
+        order = np.lexsort((np.arange(len(a)), a * len(v) + b))
+        keys = (a * len(v) + b)[order]
+        # Each half-edge a->b with a < b, matched to its twin b->a
+        last = order[np.r_[keys[1:] != keys[:-1], True]]
+        first = np.sort(last[a[last] < b[last]])
+        pos = np.searchsorted(keys, b[first] * len(v) + a[first], side="right") - 1
+        twin = order[np.maximum(pos, 0)]
+        has_twin = (pos >= 0) & (a[twin] == b[first]) & (b[twin] == a[first])
+        first, twin = first[has_twin], twin[has_twin]
+        angle_sum = _opposite_angles(v, a[first], b[first], c[first]) + _opposite_angles(v, a[first], b[first], c[twin])
+        worst_first = np.argsort(-angle_sum, kind="stable")
+        worst_first = worst_first[angle_sum[worst_first] > np.pi + 1e-6]
+        low, high = np.minimum(a, b), np.maximum(a, b)
+        edges = set(zip(low.tolist(), high.tolist()))
+        candidates = [(a[first[r]], b[first[r]], c[first[r]], c[twin[r]], face[first[r]], face[twin[r]]) for r in worst_first]
+        touched, n_flips = set(), 0
+        for a, b, c, d, i, k in candidates:
+            a, b, c, d = int(a), int(b), int(c), int(d)
+            if i in touched or k in touched or tuple(sorted((c, d))) in edges:
+                continue
+            n1, a1 = _unit_normal(v, (a, b, c))
+            n2, a2 = _unit_normal(v, (b, a, d))
+            m1, b1 = _unit_normal(v, (a, d, c))
+            m2, b2 = _unit_normal(v, (d, b, c))
+            mean = n1 * a1 + n2 * a2
+            mean /= max(np.linalg.norm(mean), 1e-15)
+            if min(b1, b2) < 1e-12 or min(m1 @ mean, m2 @ mean) < min(n1 @ mean, n2 @ mean) - 1e-9:
+                continue
+            f[i], f[k] = (a, d, c), (d, b, c)
+            touched |= {i, k}
+            edges.discard(tuple(sorted((a, b))))
+            edges.add(tuple(sorted((c, d))))
+            n_flips += 1
+        if n_flips == 0:
+            break
+    return f
+
+
+def split_long_edges(v, f, limit, max_passes=12):
+    """Longest-edge bisection of every triangle whose longest edge exceeds limit; the mesh stays
+    conforming and the shape is unchanged. Gives decimation small enough triangles to work with
+    where the input mesh has large ones."""
+    v, f = v.copy(), f.copy()
+    for _ in range(max_passes):
+        lengths = np.stack([np.linalg.norm(v[f[:, (i + 1) % 3]] - v[f[:, i]], axis=1) for i in range(3)], axis=1)
+        longest = lengths.argmax(1)
+        todo = np.where(lengths.max(1) > limit)[0]
+        if not len(todo):
+            break
+        mid, verts = {}, list(v)
+        for t in todo:
+            a, b = f[t, longest[t]], f[t, (longest[t] + 1) % 3]
+            key = (min(a, b), max(a, b))
+            if key not in mid:
+                mid[key] = len(verts)
+                verts.append((v[a] + v[b]) / 2)
+        faces = []
+        for tri in f:
+            m = [mid.get((min(tri[i], tri[(i + 1) % 3]), max(tri[i], tri[(i + 1) % 3]))) for i in range(3)]
+            n = sum(x is not None for x in m)
+            if n == 0:
+                faces.append(tri)
+            elif n == 3:
+                faces += [[tri[0], m[0], m[2]], [tri[1], m[1], m[0]], [tri[2], m[2], m[1]], [m[0], m[1], m[2]]]
+            elif n == 1:
+                i = next(j for j in range(3) if m[j] is not None)
+                faces += [[tri[i], m[i], tri[(i + 2) % 3]], [m[i], tri[(i + 1) % 3], tri[(i + 2) % 3]]]
+            else:
+                i = next(j for j in range(3) if m[j] is None)
+                a, b, c = tri[(i + 1) % 3], tri[(i + 2) % 3], tri[i]
+                x, y = m[(i + 1) % 3], m[(i + 2) % 3]
+                faces += [[b, y, x], [c, x, y], [c, a, x]]
+        v, f = np.array(verts), np.array(faces)
+    return v, f
+
+
+def smooth_on_surface(u, g, v, f, passes=SMOOTH_PASSES):
+    """Evens out the decimated mesh (u, g): each pass moves vertices halfway to the mean of their
+    neighbours along the surface, projects them back onto the input mesh (v, f), and flips edges."""
+    for _ in range(passes):
+        e = igl.edges(g)
+        total, count = np.zeros_like(u), np.zeros(len(u))
+        np.add.at(total, e[:, 0], u[e[:, 1]])
+        np.add.at(total, e[:, 1], u[e[:, 0]])
+        np.add.at(count, e[:, 0], 1)
+        np.add.at(count, e[:, 1], 1)
+        move = total / count[:, None] - u
+        n = igl.per_vertex_normals(u, g)
+        move -= np.sum(move * n, axis=1, keepdims=True) * n
+        _, _, u = igl.point_mesh_squared_distance(u + 0.5 * move, v, f)
+        g = delaunay_flips(u, g)
+    return u, g
 
 
 class SpHarm:
-    """
-    A class for mesh optimization and parameterization tasks.
-    
-    This class combines functionality from optimization.py and mesh_mapping.py,
-    providing methods for mesh parameterization and optimization.
-    """
-    
+    """A decimated organoid mesh, its area-preserving map to the unit sphere, and the SPHARM
+    expansions (shape reconstruction error, field power spectra) on that map."""
+
     def __init__(self):
-        """Initialize the SpHarm with empty attributes."""
         self.v = None  # Vertices
         self.f = None  # Faces
-        self.coors = None  # Spherical coordinates
-        self.areas = None  # Face areas
-        self.edges = None  # Mesh edges
-        self.transform_matrix = None  # Transformation matrix for PCA
-        self.clm = None  # Spherical harmonics coefficients
-        self.reconstructed_xyzs = None  # Reconstructed coordinates from SH coefficients
-        
-    def load_mesh_from_file(self, path):
-        """
-        Load a mesh from a file (STL or OBJ).
-        
-        Args:
-            path: Path to the mesh file
-            
-        Returns:
-            self: For method chaining
-        """
-        if path.endswith('.stl'):
-            self._load_stl(path)
-        elif path.endswith('.obj'):
-            self.v, self.f = igl.read_triangle_mesh(path)
-        else:
-            raise ValueError(f"Unsupported file format: {path}")
-            
-        return self
-    
-    def _load_stl(self, path):
-        """
-        Load an STL file using VTK.
-        
-        Args:
-            path: Path to the STL file
-        """
-        reader = vtk.vtkSTLReader()
-        reader.SetFileName(path)
-        reader.Update()
-        polydata = reader.GetOutput()
+        self.coors = None  # Sphere coordinates (theta, phi) of each vertex
+        self.transform_matrix = None  # PCA axes
+        self._lw = None  # Cached lat, lon and quadrature weights
 
-        # Extract vertices
-        self.v = np.array(polydata.GetPoints().GetData())
-
-        # Extract faces (cells)
-        cells = polydata.GetPolys()
-        cells.InitTraversal()
-
-        # Create an array to store the faces
-        n_faces = polydata.GetNumberOfPolys()
-        faces = np.zeros((n_faces, 3), dtype=np.int64)
-
-        # Extract all faces
-        for i in range(n_faces):
-            cell = vtk.vtkIdList()
-            cells.GetNextCell(cell)
-            for j in range(3):  # Assuming triangular faces
-                faces[i, j] = cell.GetId(j)
-        self.f = faces
-        
-        # Center and normalize
-        self.v -= self.v.mean(0)
-        self.v /= np.abs(self.v).max()
-    
     def load_from_arrays(self, vertices, faces):
-        """
-        Load mesh from vertex and face arrays.
-        
-        Args:
-            vertices: Numpy array of vertices (n_vertices, 3)
-            faces: Numpy array of faces (n_faces, 3)
-            
-        Returns:
-            self: For method chaining
-        """
         self.v = vertices
         self.f = faces
         return self
-    
+
+    @classmethod
+    def from_mesh(cls, v, f, n_faces=N_FACES):
+        """Decimated copy of a mesh (true geometry, no rescaling) for the spherical map.
+
+        Long input edges are split, the mesh is decimated, its needle triangles and folded
+        slivers are removed by edge flips, and it is smoothed along the input surface.
+        self.birth[i] is the index in `v` of the input vertex nearest decimated vertex i, so a
+        per-vertex field on the full mesh is sampled as field[self.birth]. igl.decimate
+        occasionally cannot reach the exact target on a nearly non-manifold mesh, so nearby
+        targets are tried before giving up. A mesh already at or below n_faces is used as is."""
+        sh = cls()
+        if len(f) <= n_faces:
+            sh.load_from_arrays(np.array(v, dtype=np.float64), np.array(f))
+            sh.birth = np.arange(len(v))
+            return sh
+        area = igl.doublearea(v, f).sum() / 2
+        vs, fs = split_long_edges(v, f, SPLIT_FACTOR * np.sqrt(4 * area / (np.sqrt(3) * n_faces)))
+        for target in (n_faces, int(n_faces * 1.04), int(n_faces * 0.96), int(n_faces * 1.2)):
+            ok, U, G, _, _ = igl.decimate(vs, fs, target)
+            if ok:
+                U = np.array(U, dtype=np.float64)
+                U, G = smooth_on_surface(U, delaunay_flips(U, G), v, f)
+                sh.load_from_arrays(U, G)
+                sh.birth = cKDTree(v).query(U)[1]
+                return sh
+        raise ValueError(f"igl.decimate could not reach ~{n_faces} faces")
+
+    def map_to_sphere(self, primal_steps=PRIMAL_STEPS):
+        """PCA-align, start from the radial projection when it has no folds, else from the harmonic
+        map (poles at the extremes of the first principal axis), then the area-preserving
+        optimisation. Fills self.coors (theta, phi), self.start and self.rounds."""
+        self.align_with_pca()
+        p = self.v - self.v.mean(axis=0)
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        volume = np.einsum('ij,ij->i', p[self.f[:, 0]], np.cross(p[self.f[:, 1]], p[self.f[:, 2]]))
+        if min((volume < 0).sum(), (volume > 0).sum()) == 0:
+            self.start = "radial"
+            _, theta, phi = utils.cart2sph(*p.T)
+            self.coors = np.vstack([theta, phi]).T
+        else:
+            self.start = "harmonic"
+            self.compute_initial_parameterization()
+        return self.optimize(max_outer_iterations=OUTER_ROUNDS, primal_steps=primal_steps)
+
+    def sphere_points(self):
+        x, y, z = utils.sph2cart(1, self.coors[:, 0], self.coors[:, 1])
+        return np.stack([x, y, z], axis=1)
+
+    def area_error(self):
+        """Median relative error of the mapped triangle areas against the mesh triangle
+        areas (both normalised to total 4 pi): how far the map is from area-preserving."""
+        f = np.asarray(self.f)
+        a_map = igl.doublearea(self.sphere_points(), f) / 2
+        a_tgt = igl.doublearea(self.v, f) / 2
+        a_tgt *= 4 * np.pi / a_tgt.sum()
+        return float(np.median(np.abs(a_map - a_tgt) / a_tgt))
+
+    def _latlon_weights(self):
+        """Vertex lat/lon and quadrature weights (barycentric vertex areas on the mapped
+        sphere), so the least-squares fit approximates the L2 projection on the sphere
+        even where decimation left the vertices unevenly spaced."""
+        if self._lw is None:
+            lat, lon = utils.sph2latlon(self.coors[:, 0], self.coors[:, 1])
+            w = igl.massmatrix(self.sphere_points(), self.f,
+                               igl.MASSMATRIX_TYPE_BARYCENTRIC).diagonal()
+            self._lw = lat, lon, w / w.mean()
+        return self._lw
+
+    def expand(self, field, lmax):
+        """Weighted least-squares SH expansion (pyshtools SHCoeffs) of one per-vertex field."""
+        lat, lon, w = self._latlon_weights()
+        return pysh.SHCoeffs.from_least_squares(field, lat, lon, lmax, weights=w)
+
+    def power_spectrum(self, fields, lmax):
+        """Power per degree l = 0..lmax of each column of `fields` (n_verts, W): (lmax+1, W)."""
+        fields = np.asarray(fields)
+        return np.array([self.expand(fields[:, j], lmax).spectrum()
+                         for j in range(fields.shape[1])]).T
+
+    def complexity_errors(self, lmax_max):
+        """Shape reconstruction error at lmax = 0..lmax_max: column l is the area-weighted
+        RMS distance between the vertices and their degree-<=l SPHARM reconstruction (x, y,
+        z each fitted at that lmax, evaluated at the vertices' sphere positions), divided
+        by sqrt(surface area) so it is scale-free."""
+        lat, lon, w = self._latlon_weights()
+        M = igl.massmatrix(self.v, self.f, igl.MASSMATRIX_TYPE_VORONOI).diagonal()
+        errors = []
+        for l in range(lmax_max + 1):
+            recon = np.stack([self.expand(self.v[:, i], l).expand(lat=lat, lon=lon)
+                              for i in range(3)], axis=1)
+            d2 = np.sum((self.v - recon) ** 2, axis=1)
+            errors.append(np.sqrt(np.sum(M * d2) / M.sum()) / np.sqrt(M.sum()))
+        return np.array(errors)
+
+    def save_map(self, path, **meta):
+        np.savez(path, v=self.v, f=self.f, coors=self.coors, birth=self.birth,
+                 transform_matrix=self.transform_matrix, **meta)
+
+    @classmethod
+    def load_map(cls, path):
+        """(SpHarm, meta dict) from save_map's npz."""
+        d = np.load(path, allow_pickle=True)
+        sh = cls().load_from_arrays(d["v"], d["f"])
+        sh.coors, sh.birth, sh.transform_matrix = d["coors"], d["birth"], d["transform_matrix"]
+        return sh, {k: d[k][()] for k in d.files
+                    if k not in ("v", "f", "coors", "birth", "transform_matrix")}
+
     def align_with_pca(self):
-        """
-        Align the mesh using PCA.
-        
-        Returns:
-            self: For method chaining
-        """
+        """Rotate the mesh onto its principal axes."""
         pca = PCA(n_components=3)
         pca.fit(self.v)
         self.v = pca.transform(self.v)
@@ -113,12 +277,8 @@ class SpHarm:
         return self
     
     def compute_initial_parameterization(self):
-        """
-        Compute spherical parameterization of the mesh.
-        
-        Returns:
-            self: For method chaining
-        """
+        """Harmonic map to the sphere, the start when the radial projection has folds: theta solves
+        Laplace's equation between the poles, phi solves it across a cut from pole to pole."""
         # Find extreme points as poles
         poles = np.array([np.argmax(self.v[:, 0]), np.argmin(self.v[:, 0])])
         pole_vals = np.array([0, np.pi])
@@ -140,7 +300,7 @@ class SpHarm:
         l_ib = l_ib[:, poles]
 
         # Solve PDE for theta
-        theta_in = sp.linalg.spsolve(-l_ii, l_ib.dot(pole_vals))
+        theta_in = spsolve(-l_ii, l_ib.dot(pole_vals))
 
         theta = np.empty_like(self.v[:, 1])
         theta[poles] = pole_vals 
@@ -170,17 +330,7 @@ class SpHarm:
         return angle > (ref_angle + 1e-4)
     
     def _compute_phi(self, theta, poles, v_in):
-        """
-        Compute phi coordinates by solving a PDE with branch cuts.
-        
-        Args:
-            theta: Theta coordinates
-            poles: Pole indices
-            v_in: Interior vertex indices
-            
-        Returns:
-            phi: Phi coordinates
-        """
+        """Phi coordinates from Laplace's equation with a jump of 2 pi across the branch cut."""
         neighbours = igl.adjacency_list(self.f)
         normals = igl.per_vertex_normals(self.v, self.f)
         
@@ -234,7 +384,7 @@ class SpHarm:
         l_ib = l_ib[:, lines]
 
         # Solve PDE
-        phi_in = sp.linalg.spsolve(-l_ii, l_ib.dot(line_vals))
+        phi_in = spsolve(-l_ii, l_ib.dot(line_vals))
 
         phi = np.empty_like(self.v[:, 1])
         phi[poles] = 0
@@ -243,317 +393,84 @@ class SpHarm:
         
         return phi
     
-    def _prepare_optimization(self):
-        """
-        Prepare data for optimization.
-        
-        Returns:
-            self: For method chaining
-        """
-        # Compute areas and normalize
-        self.areas = igl.doublearea(self.v, self.f)/2
-        self.areas /= np.sum(self.areas)
-        self.areas *= 4*np.pi  # normalized area
+    @staticmethod
+    def spherical_areas(u, f):
+        """Signed spherical areas of triangles f on the unit vectors u (Van Oosterom & Strackee):
+        a folded triangle has a negative area."""
+        a, b, c = u[f[:, 0]], u[f[:, 1]], u[f[:, 2]]
+        return 2 * jnp.arctan2(jnp.sum(a * jnp.cross(b, c), axis=1),
+                               1 + jnp.sum(a * b, axis=1) + jnp.sum(b * c, axis=1) + jnp.sum(c * a, axis=1))
 
-        # Get edges
-        self.edges = igl.edges(self.f)
-        
-        # Convert spherical coordinates to Cartesian 
-        # This gives the initial mapping from real space to a unit sphere 
-        theta, phi = self.coors[:, 0], self.coors[:, 1]
-        x, y, z = utils.sph2cart(1, theta, phi)
-        v_init = np.stack([x, y, z], axis=1) 
-        
-        # Convert to JAX arrays
-        self.areas = jnp.array(self.areas)
-        self.edges = jnp.array(self.edges)
-        self.f = jnp.array(self.f)
-        v_init = jnp.array(v_init)
-        return v_init 
-    
-    # JAX functions for optimization
-    @staticmethod
-    @jit
-    def jax_doublearea(v, f):
-        """Compute double area of triangles with JAX."""
-        v0 = v[f[:, 0]]
-        v1 = v[f[:, 1]]
-        v2 = v[f[:, 2]]
-        
-        e1 = v1 - v0
-        e2 = v2 - v0
-        
-        cross = jnp.cross(e1, e2)
-        doublearea = jnp.linalg.norm(cross, axis=1)
-        
-        return doublearea
-    
-    @staticmethod
-    @jit
-    def area_constraint_vec(v, f, areas):
-        """Compute area constraint vector."""
-        area_test = SpHarm.jax_doublearea(v, f)/2
-        return area_test/areas - 1  # Vector of constraint values
-    
-    @staticmethod
-    @jit
-    def norm_constraint_vec(v):
-        """Compute norm constraint vector."""
-        norms = jnp.linalg.norm(v, axis=1)
-        return norms - 1  # Vector of constraint values
-    
-    @staticmethod
-    @jit
-    def lengths_ratio(v, edges):
-        """Compute the objective function (length ratio)."""
-        return jnp.sum(v[edges[:, 0]] * v[edges[:, 1]])
-    
-    @staticmethod
-    @jit
-    def augmented_lagrangian(v_flat, f, edges, areas, lambda_area, lambda_norm, mu):
+    def optimize(self, max_outer_iterations=OUTER_ROUNDS, primal_steps=PRIMAL_STEPS):
         """
-        Compute the augmented Lagrangian function.
-        
-        Args:
-            v_flat: Flattened vertex array
-            f: Faces
-            edges: Edges
-            areas: Areas
-            lambda_area: Lagrange multipliers for area constraint
-            lambda_norm: Lagrange multipliers for norm constraint
-            mu: Penalty parameter
-            
-        Returns:
-            Augmented Lagrangian value
-        """
-        v = v_flat.reshape(-1, 3)
-        
-        # Objective function
-        obj_value = SpHarm.lengths_ratio(v, edges)
-        
-        # Compute constraint values
-        c_area = SpHarm.area_constraint_vec(v, f, areas)
-        c_norm = SpHarm.norm_constraint_vec(v)
-        
-        # Lagrangian terms
-        lagrange_area = jnp.sum(lambda_area * c_area)
-        lagrange_norm = jnp.sum(lambda_norm * c_norm)
-        
-        # Penalty terms
-        penalty_area = (mu/2) * jnp.sum(jnp.square(c_area))
-        penalty_norm = (mu/2) * jnp.sum(jnp.square(c_norm))
-        
-        return obj_value + lagrange_area + lagrange_norm + penalty_area + penalty_norm
-    
-    def optimize_primal(self, v_flat, lambda_area, lambda_norm, mu, learning_rate, num_steps):
-        """
-        Optimize the primal variables (vertices).
-        
-        Args:
-            v_flat: Flattened vertex array
-            lambda_area: Lagrange multipliers for area constraint
-            lambda_norm: Lagrange multipliers for norm constraint
-            mu: Penalty parameter
-            learning_rate: Learning rate for optimizer
-            num_steps: Number of optimization steps
-            
-        Returns:
-            Optimized flattened vertex array
-        """
-        # Create the augmented Lagrangian for fixed multipliers
-        def loss_fn(v_flat):
-            return self.augmented_lagrangian(v_flat, self.f, self.edges, self.areas, 
-                                            lambda_area, lambda_norm, mu)
-        
-        value_and_grad_fn = jit(value_and_grad(loss_fn))
-        
-        # Optimizer for primal variables
-        optimizer = optax.adam(learning_rate=learning_rate)
-        opt_state = optimizer.init(v_flat)
-        
-        # Optimization loop
-        for i in range(num_steps):
-            loss, grad_val = value_and_grad_fn(v_flat)
-            updates, opt_state = optimizer.update(grad_val, opt_state)
-            v_flat = optax.apply_updates(v_flat, updates)
-        
-        return v_flat
-    
-    def optimize(self, max_outer_iterations=20, primal_steps=100, verbose=True):
-        """
-        Run the augmented Lagrangian optimization method.
-        This finds the best mapping of the mesh to a unit sphere that preserves the area of each trianglular face of the original mesh and the angle between the edges of the mesh.
-        
+        Run the augmented Lagrangian optimization method from the current self.coors.
+        This finds a map of the mesh to the unit sphere that preserves the area around each vertex
+        (a third of its triangles), minimising the Dirichlet energy of the map on the mesh, the
+        sum over edges of cotangent weight (scaled to mean 1) x (1 - u_i . u_j). Each round is an
+        L-BFGS solve; it stops once the energy has settled and the area constraints are met.
+
         Args:
             max_outer_iterations: Maximum number of outer iterations
-            primal_steps: Number of primal optimization steps per outer iteration
-            
+            primal_steps: Maximum number of L-BFGS iterations per outer iteration
+
         Returns:
             self: For method chaining
         """
-        # Initialize primal variables
-        v_init = self._prepare_optimization()
-        v_flat = v_init.reshape(-1)
-        
-        # Initialize Lagrange multipliers
-        v = v_flat.reshape(-1, 3)
-        lambda_area = jnp.zeros_like(self.area_constraint_vec(v, self.f, self.areas))
-        lambda_norm = jnp.zeros_like(self.norm_constraint_vec(v))
-        
-        # Initialize penalty parameter
-        mu = 10.0
-        mu_max = 1e8
-        mu_factor = 10.0
-        
-        # Learning rate for primal optimization
-        learning_rate = 0.01
-        
-        # Outer loop - update Lagrange multipliers
+        y = self.sphere_points()
+        f = np.asarray(self.f)
+
+        # Wind the faces so that the initial map has positive total area
+        if float(jnp.sum(self.spherical_areas(jnp.array(y), jnp.array(f)))) < 0:
+            f = f[:, [0, 2, 1]]
+        a_tgt = igl.doublearea(self.v, f) / 2
+        a_tgt *= 4 * np.pi / a_tgt.sum()
+        ring_tgt = np.zeros(len(y))
+        np.add.at(ring_tgt, f.ravel(), np.repeat(a_tgt / 3, 3))
+
+        edges = igl.edges(f)
+        w = np.asarray(igl.cotmatrix(self.v, f).tocsr()[edges[:, 0], edges[:, 1]]).ravel()
+        w, edges, faces, ring_tgt = jnp.array(w / w.mean()), jnp.array(edges), jnp.array(f), jnp.array(ring_tgt)
+
+        def unit(y):
+            return y / jnp.linalg.norm(y, axis=1, keepdims=True)
+
+        def constraints(y):
+            a = self.spherical_areas(unit(y), faces)
+            return jnp.zeros(len(ring_tgt)).at[faces.ravel()].add(jnp.repeat(a / 3, 3)) / ring_tgt - 1
+
+        def energy(y):
+            u = unit(y)
+            return jnp.sum(w * (1 - jnp.sum(u[edges[:, 0]] * u[edges[:, 1]], axis=1)))
+
+        def loss(y, lam, mu):
+            c = constraints(y)
+            return energy(y) + jnp.sum(lam * c) + mu / 2 * jnp.sum(c * c)
+
+        loss_and_grad, energy, constraints = jit(value_and_grad(loss)), jit(energy), jit(constraints)
+        lam, mu, mu_max, mu_factor = jnp.zeros(len(ring_tgt)), 10.0, 1e3, 10.0
+        prev = None
+
         for outer_iter in range(max_outer_iterations):
-            if verbose:
-                print(f"Outer iteration {outer_iter}, mu = {mu}")
-            
-            # Optimize primal variables
-            v_flat = self.optimize_primal(v_flat, lambda_area, lambda_norm, mu, learning_rate, primal_steps)
-            v = v_flat.reshape(-1, 3)
-            
-            # Compute constraint violations
-            c_area = self.area_constraint_vec(v, self.f, self.areas)
-            c_norm = self.norm_constraint_vec(v)
-            
-            # Check constraint satisfaction
-            area_violation = jnp.max(jnp.abs(c_area))
-            norm_violation = jnp.max(jnp.abs(c_norm))
-            
-            if outer_iter % 5 == 0 and verbose:
-                print(f"  Max area constraint violation: {area_violation}")
-                print(f"  Max norm constraint violation: {norm_violation}")
-            
-            # Check for convergence
-            if area_violation < 1e-6 and norm_violation < 1e-6:
-                if verbose:
-                    print("Constraints satisfied, optimization complete.")
+            def fun(z):
+                value, g = loss_and_grad(jnp.array(z.reshape(-1, 3)), lam, mu)
+                return float(value), np.array(g).ravel()
+
+            res = minimize(fun, np.asarray(y).ravel(), jac=True, method="L-BFGS-B",
+                           options=dict(maxiter=primal_steps, maxcor=20, ftol=1e-13, gtol=1e-7))
+            y = unit(jnp.array(res.x.reshape(-1, 3)))
+            c = constraints(y)
+            lam = lam + mu * c
+            cost = float(energy(y))
+            self.rounds = outer_iter + 1
+            if (prev is not None and abs(cost - prev) / cost < ENERGY_TOL
+                    and float(jnp.abs(c).max()) < AREA_TOL):
                 break
-            
-            # Update Lagrange multipliers
-            lambda_area = lambda_area + mu * c_area
-            lambda_norm = lambda_norm + mu * c_norm
-            
-            # Update penalty parameter
+            prev = cost
             if outer_iter > 0 and outer_iter % 3 == 0:
                 mu = min(mu_max, mu * mu_factor)
-        
-        optimized_v = v_flat.reshape(-1, 3)
 
-        # Convert the optimized coordinates on a unit sphere to spherical coordinates
-        x, y, z = optimized_v.T
-        _, theta, phi = utils.cart2sph(x, y, z)
+        _, theta, phi = utils.cart2sph(*np.array(y).T)
         self.coors = np.vstack([theta, phi]).T
-
-        # Revert jnp arrays to numpy arrays 
-        self.f = np.array(self.f)
-        self.v = np.array(self.v) 
+        self._lw = None
 
         return self
-    
-    def compute_sh_coefficients(self, lmax=15):
-        """
-        Analyze optimized vertices using spherical harmonics.
-        
-        Args:
-            lmax: Maximum degree for SH coefficients
-            grid_lmax: Maximum degree for expanded grid
-            
-        Returns:
-            clms: Spherical harmonics coefficients
-        """
-        theta, phi = self.coors[:, 0], self.coors[:, 1]
-        
-        # Convert to lat/lon
-        lat, lon = utils.sph2latlon(theta, phi)
-        
-        
-        self.clms = [] 
-        for i in range(3):
-            x = self.v[:, i]
-            
-            # Compute SH coefficients
-            sh = pysh.SHCoeffs.from_least_squares(x, lat, lon, lmax)
-            self.clms.append(sh.to_array())
-
-        self.clms = np.array(self.clms)
-    
-        return self.clms
-    
-    def reconstruct_from_sh(self, grid_lmax=50):
-        '''
-        Reconstruct the shape from spherical harmonics coefficients.
-        Args: 
-            grid_lmax: lmax used when reconstructing the grid. To not lose information, it should be larger than the lmax used to compute the SH coefficients.
-
-        Returns: 
-            points: Reconstructed points in Cartesian coordinates, after undoing the PCA transformation.
-            latlon_grid: (lat_grid, lon_grid) for the reconstructed points.
-        '''
-        points = [] 
-        for i in range(3): 
-            # Expand the SH coefficients for each coordinate 
-            clm = self.clms[i]
-            sh = pysh.SHCoeffs.from_array(clm)
-            grid = sh.expand(lmax=grid_lmax)
-            points.append(grid.to_array())
-
-        points = np.array(points)
-        points = np.einsum('ij,jkl->ikl', np.linalg.inv(self.transform_matrix), points)
-        latlon_grid = np.meshgrid(grid.lats(), grid.lons(), indexing='ij')
-
-        return points, latlon_grid 
-
-    def save_results(self, path):
-        """
-        Save results to files.
-        Assumes that self.v and self.f are post pca transformation. 
-        
-        Args:
-            path: Path to save results
-        """
-        if self.transform_matrix is not None:
-            np.save(path + '_transform_matrix.npy', self.transform_matrix)
-
-        if self.coors is not None:
-            np.save(path + '_coors.npy', self.coors)
-
-        if self.clms is not None:
-            np.save(path + '_clms.npy', self.clms)
-
-        if self.v is not None and self.f is not None:
-            igl.write_triangle_mesh(path + '_transformed_mesh.obj', self.v, self.f)
-
-    def load_results(self, path):
-        """
-        Load results from files.
-        
-        Args:   
-        """
-        self.transform_matrix = np.load(path + '_transform_matrix.npy')
-        self.coors = np.load(path + '_coors.npy')
-        self.clms = np.load(path + '_clms.npy')
-        self.v, self.f = igl.read_triangle_mesh(path + '_transformed_mesh.obj')
-
-
-# Example usage:
-if __name__ == "__main__":
-
-    from tqdm import tqdm
-
-
-    # Organoid 5 & 40 (fairly spherical), 27 & 33 & 42 (one crypt, elongated), 20 & 32 (two crypts, elongated), 23 & 35 (two crypts, at an angle like mickey mouse), 29 (three crypts), 28 & 38 (blobby)
-    for n in tqdm([5, 20, 23, 27, 28, 29, 32, 33, 35, 38, 40, 42]):
-        path = f'Data/mesh/{n}.stl'
-        m = SpHarm()
-        m.load_mesh_from_file(path)  
-        m.align_with_pca() 
-        m.compute_initial_parameterization()
-        m.optimize(max_outer_iterations=100, primal_steps=100, verbose=False)
-        clms = m.compute_sh_coefficients(lmax=15)
-        m.save_results(f'sim/{n}')

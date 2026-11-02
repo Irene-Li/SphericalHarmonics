@@ -12,9 +12,7 @@ plot_coor.ipynb
 /src/__pycache__
 /archive
 /spectralML
-/sim/meshharm
-/sim/spharm
-/sim
+/output
 /Figures
 
 # ML experiment outputs (model weights, embeddings, operator caches)
@@ -32,3 +30,6 @@ Data/small_meshes/sphere_cd_cache.json
 .claude/
 .polyscope.ini
 imgui.ini
+
+# method comparisons / diagnostics (SPHARM vs manifold, review labelling, sweeps): kept local
+/analysis

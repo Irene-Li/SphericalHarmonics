@@ -6,22 +6,23 @@ shapes too (the old vocab was fit only on Data/20260224 = WT main, no perts).
 Pipeline (reproduces the original bag-of-features vocab logic, from the
 now-removed bag_of_features.ipynb):
   decimate -> per-vertex HKS at N_TIMES variable times -> per-organoid normalise
-  -> RECON_PCTL-percentile recon-quality filter -> complexity-balanced subsample
-  (COMPLEXITY_INTERVALS) -> Normalizer -> curvature mask (|z(col0)| < CURV_Z)
+  -> complexity-balanced subsample (COMPLEXITY_INTERVALS of the SPHARM l_cross_values
+  in MASTER; organoids not in MASTER are left out) -> Normalizer -> curvature mask
+  (|z(col0)| < CURV_Z)
   -> KMeans (KMEANS_K) for the kmeans vocab, PCA (PCA_COMPS) for the pca vocab.
 It walks each dataset's config.json timepoints and reads
 vtp/<tp>/fm_data/good_labels_<tp>.npy. Eigenvalues/eigenvectors are NOT
 recomputed — they are read from the saved _coeffs.npz (run_new_meshes.py output).
 
 Speed: the slow per-mesh load is cached (utils.build_hks_cache / load_hks_cache)
-to sim/hks_cache_variable_time.npz; this script reads that cache when it matches
+to output/hks_cache_variable_time.npz; this script reads that cache when it matches
 the current good_labels + N_TIMES/DECIMATE_FACE and (re)builds it on a miss, a
 stale cache, or --refresh-cache. Meshes igl.decimate cannot collapse
 (non-manifold) are skipped.
 
 Outputs (format read unchanged by compute_master_npz; +meta_* provenance keys):
-  sim/vocab_variable_time.npz       vocab (KMEANS_K, N_TIMES), scaler (Normalizer), sigma
-  sim/vocab_pca_variable_time.npz   components (PCA_COMPS, N_TIMES), mean, scaler
+  output/vocab_variable_time.npz       vocab (KMEANS_K, N_TIMES), scaler (Normalizer), sigma
+  output/vocab_pca_variable_time.npz   components (PCA_COMPS, N_TIMES), mean, scaler
 
 Run in the scmpx env:
   KMP_DUPLICATE_LIB_OK=TRUE /opt/homebrew/anaconda3/envs/scmpx/bin/python build_vocab.py --workers 6
@@ -47,12 +48,11 @@ N_TIMES       = 20
 DECIMATE_FACE = 200
 KMEANS_K      = 8
 PCA_COMPS     = 3
-COMPLEXITY_THRESHOLD = 0.005                 # recon-error cutoff defining the complexity (l_cross) value
+MASTER        = "Data/npz/master.npz"      # complexity = its l_cross_values (SPHARM)
 COMPLEXITY_INTERVALS = [(0, 5.3), (5.3, np.inf)]
-RECON_PCTL    = 100
 CURV_Z        = 4
 SEED          = 42
-CACHE_PATH    = "sim/hks_cache_variable_time.npz"   # HKS cache (utils.build_hks_cache / load_hks_cache)
+CACHE_PATH    = "output/hks_cache_variable_time.npz"   # HKS cache (utils.build_hks_cache / load_hks_cache)
 
 
 def find_times(area, n=N_TIMES):
@@ -60,17 +60,23 @@ def find_times(area, n=N_TIMES):
     return np.exp(2 * np.linspace(0, np.log(final_time), n))
 
 
-def complexity(m, threshold=COMPLEXITY_THRESHOLD):
-    # max SH degree (lmax) at which recon error first drops below threshold;
-    # lmax scale (0 = single degree-0 mode); same definition as compute_master_npz l_cross.
-    for l in range(1, m.lmax + 1):
-        if m.compute_recon_quality(lmax=l) < threshold:
-            return l - 1
-    return m.lmax - 1
+_L_CROSS = None
+
+
+def complexity(save_path):
+    """l_cross of the organoid at save_path ('Data/<dataset>/.../fm_data/<label>') from
+    MASTER, NaN if it is not there (then it falls in no COMPLEXITY_INTERVALS group)."""
+    global _L_CROSS
+    if _L_CROSS is None:
+        m = np.load(MASTER, allow_pickle=True)
+        _L_CROSS = dict(zip(m["ids"].astype(str), m["l_cross_values"]))
+    dataset = os.path.normpath(save_path).split(os.sep)[1]
+    return float(_L_CROSS.get(f"{dataset}_{os.path.basename(save_path)}", np.nan))
 
 
 def load_one(save_path):
-    """Return (hks[n_decim_verts, N_TIMES], frac, complexity, area) for one organoid.
+    """Return (hks[n_decim_verts, N_TIMES], frac, complexity, area) for one organoid
+    (frac is NaN: kept only for the utils HKS-cache layout).
     Decimate to DECIMATE_FACE faces, compute per-vertex HKS at find_times(area) on
     the surviving vertices. Raises if the mesh is non-manifold (igl.decimate fails)."""
     m = FateMarkers()
@@ -86,7 +92,7 @@ def load_one(save_path):
         np.einsum('i, ji->j', np.exp(-m.eigvals * t), eigvecs[new_indices, :] ** 2)
         for t in ts
     ]).T
-    return hks, m.compute_recon_quality(), complexity(m), m.area
+    return hks, np.nan, complexity(save_path), m.area
 
 
 def _run_one(save_path):
@@ -146,13 +152,7 @@ def main():
     hkss, fracs, complexities = cached
     print(f"loaded {len(hkss)} organoids from HKS cache {CACHE_PATH}")
 
-    # ---- 95th-pct recon-quality filter ----
-    recon_mask = fracs < np.percentile(fracs, RECON_PCTL)
-    recon_idx  = np.where(recon_mask)[0]
-    filtered_hkss         = [hkss[i] for i in recon_idx]
-    filtered_complexities = complexities[recon_mask]
-    print(f"recon filter: kept {len(filtered_hkss)}/{len(hkss)} "
-          f"(dropped worst {100 - RECON_PCTL}% recon)")
+    filtered_hkss, filtered_complexities = hkss, complexities
 
     # ---- complexity-balanced subsample ----
     rng = np.random.default_rng(SEED)
@@ -201,19 +201,17 @@ def main():
         meta_pca_comps=PCA_COMPS,
         meta_n_times=N_TIMES,
         meta_decimate_face=DECIMATE_FACE,
-        meta_complexity_threshold=COMPLEXITY_THRESHOLD,
+        meta_master=MASTER,
         meta_complexity_intervals=np.array(COMPLEXITY_INTERVALS, dtype=float),
-        meta_recon_pctl=RECON_PCTL,
         meta_curv_z=CURV_Z,
         meta_seed=SEED,
         meta_n_loaded=len(hkss),
-        meta_n_after_recon=len(filtered_hkss),
         meta_samples_per_group=samples_per_group,
         meta_n_train_points=int(collected_hks.shape[0]),
         meta_n_curv_points=int(filtered_rescaled_hks.shape[0]),
     )
-    km_out  = f"sim/vocab_variable_time{args.suffix}.npz"
-    pca_out = f"sim/vocab_pca_variable_time{args.suffix}.npz"
+    km_out  = f"output/vocab_variable_time{args.suffix}.npz"
+    pca_out = f"output/vocab_pca_variable_time{args.suffix}.npz"
 
     np.savez(km_out, vocab=vocab, scaler=scaler, sigma=sigma, **meta)
     print(f"saved {km_out}")
