@@ -5,19 +5,18 @@ shapes too (the old vocab was fit only on Data/20260224 = WT main, no perts).
 
 Pipeline (reproduces the original bag-of-features vocab logic, from the
 now-removed bag_of_features.ipynb):
-  decimate -> per-vertex HKS at N_TIMES variable times -> per-organoid normalise
-  -> complexity-balanced subsample (COMPLEXITY_INTERVALS of the SPHARM l_cross_values
-  in MASTER; organoids not in MASTER are left out) -> Normalizer -> curvature mask
-  (|z(col0)| < CURV_Z)
+  the organoids in TRAINING_LIST -> decimate -> per-vertex HKS at N_TIMES variable times
+  -> per-organoid normalise -> Normalizer -> curvature mask (|z(col0)| < CURV_Z)
   -> KMeans (KMEANS_K) for the kmeans vocab, PCA (PCA_COMPS) for the pca vocab.
-It walks each dataset's config.json timepoints and reads
-vtp/<tp>/fm_data/good_labels_<tp>.npy. Eigenvalues/eigenvectors are NOT
-recomputed — they are read from the saved _coeffs.npz (run_new_meshes.py output).
+TRAINING_LIST is a random sample of organoids biased towards high-complexity ones, half
+complex and half drawn from the rest, in the order their vertices are pooled (the KMeans
+initialisation depends on it). Eigenvalues/eigenvectors are NOT recomputed — they are read
+from the saved _coeffs.npz (run_new_meshes.py output).
 
 Speed: the slow per-mesh load is cached (utils.build_hks_cache / load_hks_cache)
 to output/hks_cache_variable_time.npz; this script reads that cache when it matches
-the current good_labels + N_TIMES/DECIMATE_FACE and (re)builds it on a miss, a
-stale cache, or --refresh-cache. Meshes igl.decimate cannot collapse
+TRAINING_LIST + N_TIMES/DECIMATE_FACE and (re)builds it on a miss, a stale cache, or
+--refresh-cache. Meshes igl.decimate cannot collapse
 (non-manifold) are skipped.
 
 Outputs (format read unchanged by compute_master_npz; +meta_* provenance keys):
@@ -26,12 +25,11 @@ Outputs (format read unchanged by compute_master_npz; +meta_* provenance keys):
 
 Run in the scmpx env:
   KMP_DUPLICATE_LIB_OK=TRUE /opt/homebrew/anaconda3/envs/scmpx/bin/python build_vocab.py --workers 6
-    --refresh-cache   ignore/rewrite the HKS cache (use after good_labels change)
+    --refresh-cache   ignore/rewrite the HKS cache
     --suffix _foo     write vocab_*_foo.npz beside the live vocab (non-destructive)
 """
 
 import os
-import json
 import argparse
 
 import numpy as np
@@ -48,8 +46,7 @@ N_TIMES       = 20
 DECIMATE_FACE = 200
 KMEANS_K      = 8
 PCA_COMPS     = 3
-MASTER        = "Data/npz/master.npz"      # complexity = its l_cross_values (SPHARM)
-COMPLEXITY_INTERVALS = [(0, 5.3), (5.3, np.inf)]
+TRAINING_LIST = "vocab_training_organoids.txt"   # fm_data save paths the vocab is fitted on
 CURV_Z        = 4
 SEED          = 42
 CACHE_PATH    = "output/hks_cache_variable_time.npz"   # HKS cache (utils.build_hks_cache / load_hks_cache)
@@ -60,23 +57,9 @@ def find_times(area, n=N_TIMES):
     return np.exp(2 * np.linspace(0, np.log(final_time), n))
 
 
-_L_CROSS = None
-
-
-def complexity(save_path):
-    """l_cross of the organoid at save_path ('Data/<dataset>/.../fm_data/<label>') from
-    MASTER, NaN if it is not there (then it falls in no COMPLEXITY_INTERVALS group)."""
-    global _L_CROSS
-    if _L_CROSS is None:
-        m = np.load(MASTER, allow_pickle=True)
-        _L_CROSS = dict(zip(m["ids"].astype(str), m["l_cross_values"]))
-    dataset = os.path.normpath(save_path).split(os.sep)[1]
-    return float(_L_CROSS.get(f"{dataset}_{os.path.basename(save_path)}", np.nan))
-
-
 def load_one(save_path):
     """Return (hks[n_decim_verts, N_TIMES], frac, complexity, area) for one organoid
-    (frac is NaN: kept only for the utils HKS-cache layout).
+    (frac and complexity are NaN: kept only for the utils HKS-cache layout).
     Decimate to DECIMATE_FACE faces, compute per-vertex HKS at find_times(area) on
     the surviving vertices. Raises if the mesh is non-manifold (igl.decimate fails)."""
     m = FateMarkers()
@@ -92,7 +75,7 @@ def load_one(save_path):
         np.einsum('i, ji->j', np.exp(-m.eigvals * t), eigvecs[new_indices, :] ** 2)
         for t in ts
     ]).T
-    return hks, np.nan, complexity(save_path), m.area
+    return hks, np.nan, np.nan, m.area
 
 
 def _run_one(save_path):
@@ -109,21 +92,9 @@ def normalise(hks):
     return hks / np.mean(hks, axis=0, keepdims=True) - 1
 
 
-def gather_save_paths():
-    paths = []
-    for ds in DATASETS:
-        with open(f"{ds}/config.json") as f:
-            cfg = json.load(f)
-        vtp_dir = cfg.get("vtp_dir", "vtp")
-        for tp in cfg["timepoints"]:
-            fm_dir = os.path.join(ds, vtp_dir, tp, "fm_data")
-            gl = os.path.join(fm_dir, f"good_labels_{tp}.npy")
-            if not os.path.exists(gl):
-                print(f"  [skip] no good_labels at {gl}")
-                continue
-            for label in np.load(gl, allow_pickle=True):
-                paths.append(os.path.join(fm_dir, str(label)))
-    return paths
+def read_training_list(path=TRAINING_LIST):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
 
 def main():
@@ -137,8 +108,8 @@ def main():
                     help="ignore any existing HKS cache, reload meshes, and rewrite the cache")
     args = ap.parse_args()
 
-    save_paths = gather_save_paths()
-    print(f"organoids: {len(save_paths)} across {len(DATASETS)} datasets")
+    save_paths = read_training_list()
+    print(f"training organoids: {len(save_paths)} from {TRAINING_LIST}")
 
     # read the HKS cache; (re)build it via utils.build_hks_cache on miss/stale/refresh
     cached = None if args.refresh_cache else utils.load_hks_cache(
@@ -149,25 +120,13 @@ def main():
         utils.build_hks_cache(CACHE_PATH, save_paths, _run_one, N_TIMES, DECIMATE_FACE,
                               DATASETS, args.workers)
         cached = utils.load_hks_cache(CACHE_PATH, save_paths, N_TIMES, DECIMATE_FACE)
-    hkss, fracs, complexities = cached
+    hkss, _, _ = cached
+    if len(hkss) != len(save_paths):
+        raise SystemExit(f"only {len(hkss)} of the {len(save_paths)} training organoids loaded")
     print(f"loaded {len(hkss)} organoids from HKS cache {CACHE_PATH}")
 
-    filtered_hkss, filtered_complexities = hkss, complexities
-
-    # ---- complexity-balanced subsample ----
-    rng = np.random.default_rng(SEED)
-    per_group = [int(np.sum((filtered_complexities >= lo) & (filtered_complexities <= hi)))
-                 for lo, hi in COMPLEXITY_INTERVALS]
-    samples_per_group = int(np.min(per_group))
-    print(f"complexity groups {COMPLEXITY_INTERVALS} counts {per_group} "
-          f"-> {samples_per_group} each")
-    selected_indices = []
-    for lo, hi in COMPLEXITY_INTERVALS:
-        gi = np.where((filtered_complexities >= lo) & (filtered_complexities <= hi))[0]
-        selected_indices.extend(rng.choice(gi, size=samples_per_group, replace=False))
-
     # ---- per-organoid normalise, concatenate all vertices ----
-    normalised = [normalise(filtered_hkss[i]) for i in selected_indices]
+    normalised = [normalise(h) for h in hkss]
     collected_hks = np.concatenate(normalised)
     print(f"collected per-vertex HKS: {collected_hks.shape}")
 
@@ -201,12 +160,10 @@ def main():
         meta_pca_comps=PCA_COMPS,
         meta_n_times=N_TIMES,
         meta_decimate_face=DECIMATE_FACE,
-        meta_master=MASTER,
-        meta_complexity_intervals=np.array(COMPLEXITY_INTERVALS, dtype=float),
+        meta_training_list=TRAINING_LIST,
         meta_curv_z=CURV_Z,
         meta_seed=SEED,
         meta_n_loaded=len(hkss),
-        meta_samples_per_group=samples_per_group,
         meta_n_train_points=int(collected_hks.shape[0]),
         meta_n_curv_points=int(filtered_rescaled_hks.shape[0]),
     )

@@ -145,16 +145,18 @@ python review_discards.py --dataset Data/wnt_pert --master Data/npz/wnt_master.n
 ```
 
 ### 3. HKS vocabulary — `build_vocab.py`
-Fits the bag-of-features codebooks (KMeans + PCA) on per-vertex HKS pooled across
-main+sup+pert2 (complexity-balanced subsample on the SPHARM `l_cross_values` of
-`Data/npz/master.npz`; organoids not in it are left out). The slow per-mesh load is cached
+Fits the bag-of-features codebooks (KMeans + PCA) on per-vertex HKS pooled over the 1582
+organoids listed in `vocab_training_organoids.txt`: a random sample from main+sup+pert2 biased
+towards high-complexity organoids (half complex, half drawn from the rest). The list is
+fixed, so the vocab is reproduced exactly; its order is the order the vertices are pooled in,
+which the KMeans initialisation depends on. The slow per-mesh load is cached
 to `output/hks_cache_variable_time.npz` via `utils.build_hks_cache` / `load_hks_cache`
-(built automatically on first run; reused when it matches the current
-`good_labels`). Writes `output/vocab_variable_time.npz` (KMeans) and
+(built automatically on first run; reused when it matches the list). Writes
+`output/vocab_variable_time.npz` (KMeans) and
 `output/vocab_pca_variable_time.npz` (PCA), each with `meta_*` provenance keys.
 ```bash
 python build_vocab.py --workers 6
-python build_vocab.py --refresh-cache --workers 6   # after good_labels change
+python build_vocab.py --refresh-cache --workers 6   # reload the meshes
 ```
 
 ### 4. Master feature table — `compute_master_npz.py`
