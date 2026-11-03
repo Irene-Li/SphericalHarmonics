@@ -160,13 +160,13 @@ python build_vocab.py --refresh-cache --workers 6   # reload the meshes
 ```
 
 ### 4. Master feature table — `compute_master_npz.py`
-Assembles `Data/npz/master.npz`: per-organoid `areas`, `spharm_area_error` (how far the
+Assembles `Data/npz/master_full.npz`: per-organoid `areas`, `spharm_area_error` (how far the
 spherical map is from area-preserving), `complexity_errors` (SPHARM shape reconstruction error
 at lmax 0..8), `l_cross_values` (SH-degree complexity), the SPHARM power spectra
 `hks_bof_power__{kmeans,pca}_variable` (N, 8 degrees, words) of the vocab-encoded HKS, and
 `hks_amplitude`. Default folders are main+sup+pert2; `--ids FILE` restricts it to a list of uids.
-`dim_red.ipynb` and `complexity_analysis.ipynb` read the table of every organoid, built with
-`--out Data/npz/master_full.npz`.
+`dim_red.ipynb` and `complexity_analysis.ipynb` read this table of every organoid. (The older
+`Data/npz/master.npz` is a per-timepoint subset from an earlier `--ids` run, kept for reference.)
 
 The spherical map is the slow step (~4 s per organoid single-process, ~1 s with
 `--workers 6`); each one is cached to `Data/spharm_maps_vertex/<uid>.npz` and reused by every later

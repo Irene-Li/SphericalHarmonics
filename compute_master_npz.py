@@ -53,7 +53,7 @@ Usage:
 
 Defaults:
   --folders  Data/main_dataset Data/sup_dataset Data/pert2
-  --out      Data/npz/master.npz
+  --out      Data/npz/master_full.npz   (every organoid; what dim_red / complexity_analysis read)
   --workers  1
 
 --ids FILE restricts the run to the uids listed in FILE (one per line); without it
@@ -107,7 +107,7 @@ from types import SimpleNamespace
 # ---------------------------------------------------------------------------
 
 DEFAULT_FOLDERS = ["Data/main_dataset", "Data/sup_dataset", "Data/pert2"]
-DEFAULT_OUT     = "Data/npz/master.npz"
+DEFAULT_OUT     = "Data/npz/master_full.npz"
 SPHARM_MAP_DIR  = "Data/spharm_maps_vertex"
 SPHARM_MESH_DIR = "Data/spharm_meshes"
 MAP_METHOD      = "vertex_cot_lbfgs_radial"    # bump when the map method changes
