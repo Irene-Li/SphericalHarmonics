@@ -26,6 +26,12 @@ A fourth, **`wnt_pert`** (WNT perturbation, day 3.5, shape only — no fate data
 analysed for complexity only and kept in its own `Data/npz/wnt_master.npz`; see
 [WNT perturbation (complexity only)](#wnt-perturbation-complexity-only).
 
+> [!IMPORTANT]
+> **This repo does not work without the organoid meshes.** They are not included here: `Data/`
+> is git-ignored, so a fresh clone has only the code. Every step of the pipeline starts from
+> the meshes, and the viewer needs them to show an organoid. You have to obtain them separately
+> and place them as described in [Data layout](#data-layout).
+
 > Just want to explore an already-computed result? Skip to
 > [Viewing embeddings without running the pipeline](#viewing-embeddings-without-running-the-pipeline).
 
