@@ -4,7 +4,7 @@ For each organoid (rows), its decimated mesh is rebuilt on its cached spherical 
 (compute_master_npz.SPHARM_MAP_DIR/<uid>.npz) from x, y, z expanded in spherical harmonics up to
 each ℓ_max in --lmax (columns), the same reconstruction compute_master_npz.compute_complexity_errors
 uses (src.spharm.SpHarm.complexity_errors). Next to the meshes are the complexity score
-(master.npz l_cross_values) and the area-normalised RMSE vs ℓ_max curves (master.npz
+(master_full.npz l_cross_values) and the area-normalised RMSE vs ℓ_max curves (master_full.npz
 complexity_errors) with the l_cross threshold and the crossing points.
 
 Meshes are rendered with VTK off screen: smooth Phong shading under a studio light kit, in the
@@ -122,7 +122,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--uids", nargs='+', default=DEFAULT_UIDS)
     ap.add_argument("--lmax", nargs='+', type=int, default=[1, 2, 4, 6, 14])
-    ap.add_argument("--master", default="Data/npz/master.npz")
+    ap.add_argument("--master", default="Data/npz/master_full.npz")
     ap.add_argument("--out_dir", default="Figures/reconstructions")
     args = ap.parse_args()
     colours = (COLOURS * len(args.uids))[:len(args.uids)]

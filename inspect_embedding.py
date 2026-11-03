@@ -39,7 +39,7 @@ Mesh source is selectable with --source:
               - bag-of-features ('bof_<vocab>_word<k>'): per-vertex soft
                 assignment to each vocabulary in compute_master_npz.VOCABS
                 (kmeans_variable, pca_variable — same vocabs/encoding as the
-                'hks_bof_power__*' columns in master.npz), loaded from output/.
+                'hks_bof_power__*' columns in master_full.npz), loaded from output/.
             Fate fields are read from a matching .vtp if one is found (the
             pipeline does not decompose fate fields).
 
@@ -233,7 +233,7 @@ def main():
 
     # ---- bag-of-features vocabularies (--source pipeline only) ---------
     # Same vocabs/encoding compute_master_npz uses for the 'hks_bof_power__*'
-    # columns in master.npz (VOCABS: kmeans_variable, pca_variable), loaded once
+    # columns in master_full.npz (VOCABS: kmeans_variable, pca_variable), loaded once
     # here and reused for every organoid as per-vertex 'bof_<vocab>_word<k>'
     # overlays (soft-assignment encoding, not the spherical-harmonic coeffs).
     bof_vocabs = load_vocabs() if args.source == "pipeline" else []
