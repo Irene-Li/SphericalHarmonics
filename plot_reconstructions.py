@@ -11,7 +11,9 @@ Meshes are rendered with VTK off screen: smooth Phong shading under a studio lig
 PCA frame viewed down the shortest axis, all at one physical scale. They are tinted with each
 organoid's curve colour. Outputs go to --out_dir (default Figures/reconstructions):
   - reconstructions.png / .pdf: the full figure,
-  - renders/org-{i}_lmax{l}.png: each mesh render alone on a transparent background, for slides.
+  - renders/org-{i}_lmax{l}.png: each mesh render alone on a transparent background, for slides,
+  - stl/org-{i}_lmax{l}.stl: each reconstructed mesh (binary STL), centred, in the PCA frame, in
+    the fm_data mesh units (10 µm).
 
     python plot_reconstructions.py
     python plot_reconstructions.py --uids UID1 UID2 UID3 --lmax 1 2 4 6 14
@@ -69,6 +71,12 @@ def polydata(v, f):
     nrm.SetInputData(pd); nrm.SplittingOff(); nrm.ConsistencyOn(); nrm.AutoOrientNormalsOn()
     nrm.Update()
     return nrm.GetOutput()
+
+
+def write_stl(path, v, f):
+    """Binary STL of a mesh, with its triangles wound consistently."""
+    w = vtk.vtkSTLWriter()
+    w.SetFileName(path); w.SetFileTypeToBinary(); w.SetInputData(polydata(v, f)); w.Write()
 
 
 def render(v, f, colour, R, px=500, supersample=3, ambient=0.32, diffuse=0.68, specular=0.2,
@@ -135,6 +143,7 @@ def main():
     # --- renders: one physical scale for every panel ----------------------------------------
     R = max(np.abs(v[:, :2]).max() for r in recs for v in r.values()) * 1.04
     os.makedirs(f"{args.out_dir}/renders", exist_ok=True)
+    os.makedirs(f"{args.out_dir}/stl", exist_ok=True)
     imgs = []
     for i, (r, f, col) in enumerate(zip(recs, faces, colours)):
         imgs.append([])
@@ -142,6 +151,7 @@ def main():
             img = render(r[l], f, col, R)
             Image.fromarray(img).save(f"{args.out_dir}/renders/org-{i + 1}_lmax{l}.png")
             imgs[-1].append(img)
+            write_stl(f"{args.out_dir}/stl/org-{i + 1}_lmax{l}.stl", r[l], f)
 
     # --- figure -------------------------------------------------------------------------------
     plt.rcParams.update({'font.family': 'Arial', 'mathtext.fontset': 'custom',
@@ -199,7 +209,7 @@ def main():
 
     for ext in ('png', 'pdf'):
         fig.savefig(f"{args.out_dir}/reconstructions.{ext}", dpi=300, facecolor='white')
-    print(f"saved {args.out_dir}/reconstructions.png/.pdf and {n * k} renders in {args.out_dir}/renders/")
+    print(f"saved {args.out_dir}/reconstructions.png/.pdf and {n * k} renders and STLs in {args.out_dir}/renders/ and stl/")
 
 
 if __name__ == "__main__":
