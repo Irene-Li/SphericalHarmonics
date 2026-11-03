@@ -60,9 +60,8 @@ Each dataset folder holds its meshes plus the tables the pipeline reads:
 Data/
 ├── npz/                       # master_full.npz, master.npz, wnt_master.npz, fate_percentages.npz (dim_red cache)
 ├── spharm_maps_vertex/<uid>.npz  # cached spherical map + decimated, smoothed mesh per organoid (compute_master_npz)
-├── spharm_meshes/<uid>.obj    # the same decimated, smoothed mesh, for viewing
+├── spharm_meshes/<uid>.obj    # the same mesh for viewing, written whenever a map is computed; not read by the pipeline
 ├── highlight_organoids.json   # organoids drawn on dim_red's highlight figure
-├── uid_groups.json            # hand-picked shape groups (inspect_embedding.py 'uid_group' colouring)
 ├── main_dataset/
 │   ├── config.json            # layout, timepoints, fate marker names, discard rules
 │   ├── vtp/<timepoint>/*.vtp  # one mesh per organoid (+ fm_data/ after run_new_meshes)
