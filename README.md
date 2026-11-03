@@ -270,12 +270,7 @@ python manage_discards.py update --dataset Data/wnt_pert          # sphericity >
 python run_new_meshes.py Data/wnt_pert --workers 6
 python compute_master_npz.py --folders Data/wnt_pert --out Data/npz/wnt_master.npz --complexity-only
 ```
-`wnt_complexity.ipynb` then compares the four Wnt-plate conditions with each other (against the
-plate control), with WT day 3.5 and the WT time course, and with the pert2 drugs — `l_cross`, the
-reconstruction error at degrees 8 and 2, and sphericity — using exactly the rows of `master.npz` and
-`wnt_master.npz` (no extra filtering). It writes its figures to `Figures/wnt_*.png` and
-`output/wnt_complexity_recon_errors.csv`, which has the same columns as `complexity_analysis.ipynb`'s
-`output/complexity_recon_errors.csv`.
+`wnt_complexity.ipynb` then writes the complexity of every organoid in `wnt_master.npz` to `output/wnt_complexity.csv` and compares the control wells with each IWP2 condition in `Figures/wnt_complexity_by_condition.png`.
 
 ### Supporting: `complexity_analysis.ipynb`
 Inspects per-degree reconstruction error to choose the `l_cross` threshold and
